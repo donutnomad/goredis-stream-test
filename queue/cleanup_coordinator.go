@@ -2,11 +2,11 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"log"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // CleanupCoordinator 清理协调器，用于协调多个消费者的清理操作
@@ -42,9 +42,9 @@ func (cc *CleanupCoordinator) TryAcquireCleanupLock(ctx context.Context, consume
 
 	// 检查锁的持有者
 	holder, err := cc.client.Get(ctx, cc.lockKey).Result()
-	if err != nil && err != redis.Nil {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Printf("检查锁持有者失败: %v", err)
-	} else if err != redis.Nil {
+	} else if !errors.Is(err, redis.Nil) {
 		log.Printf("清理锁被 %s 持有，跳过清理", holder)
 	}
 
@@ -102,7 +102,7 @@ func (cc *CleanupCoordinator) ExtendCleanupLock(ctx context.Context, consumerNam
 // IsCleanupInProgress 检查是否有清理操作正在进行
 func (cc *CleanupCoordinator) IsCleanupInProgress(ctx context.Context) (bool, string, error) {
 	holder, err := cc.client.Get(ctx, cc.lockKey).Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return false, "", nil
 	}
 	if err != nil {

@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -338,7 +339,7 @@ func (mq *MessageQueue) createConsumerGroup(ctx context.Context) error {
 
 	// 尝试创建消费者组
 	err := mq.client.XGroupCreate(ctx, mq.streamName, mq.groupName, startID).Err()
-	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP Consumer Group name already exists") {
+	if err != nil && !strings.Contains(err.Error(), "Consumer Group name already exists") {
 		// 如果stream不存在，先创建一个空的stream
 		if strings.Contains(err.Error(), "ERR The XGROUP subcommand requires the key to exist") {
 			_, err = mq.client.XAdd(ctx, &redis.XAddArgs{
@@ -350,7 +351,7 @@ func (mq *MessageQueue) createConsumerGroup(ctx context.Context) error {
 			}
 			// 再次尝试创建消费者组
 			err = mq.client.XGroupCreate(ctx, mq.streamName, mq.groupName, startID).Err()
-			if err != nil && !strings.Contains(err.Error(), "BUSYGROUP Consumer Group name already exists") {
+			if err != nil && !strings.Contains(err.Error(), "Consumer Group name already exists") {
 				return err
 			}
 		} else {
@@ -474,7 +475,7 @@ func (mq *MessageQueue) processNewMessagesSingle(ctx context.Context) {
 			}).Result()
 
 			if err != nil {
-				if err != redis.Nil {
+				if !errors.Is(err, redis.Nil) {
 					log.Printf("读取新消息失败: %v", err)
 
 					// 检查是否是因为Stream或消费者组被删除
@@ -518,7 +519,7 @@ func (mq *MessageQueue) processNewMessagesBatch(ctx context.Context) {
 			}).Result()
 
 			if err != nil {
-				if err != redis.Nil {
+				if !errors.Is(err, redis.Nil) {
 					log.Printf("读取批量消息失败: %v", err)
 
 					// 检查是否是因为Stream或消费者组被删除
@@ -734,31 +735,11 @@ func isStreamOrGroupDeletedError(err error) bool {
 	}
 
 	for _, pattern := range patterns {
-		if contains(errStr, pattern) {
+		if strings.Contains(errStr, pattern) {
 			return true
 		}
 	}
 
-	return false
-}
-
-// contains 检查字符串是否包含子字符串（简单实现）
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) &&
-		(s == substr ||
-			(len(s) > len(substr) &&
-				(s[:len(substr)] == substr ||
-					s[len(s)-len(substr):] == substr ||
-					containsInMiddle(s, substr))))
-}
-
-// containsInMiddle 检查字符串中间是否包含子字符串
-func containsInMiddle(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
 	return false
 }
 
