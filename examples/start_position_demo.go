@@ -46,7 +46,7 @@ func main() {
 
 	// 第一步：发布一些历史消息
 	fmt.Println("📝 步骤1: 发布历史消息")
-	producer := queue.NewMessageQueue(rdb, streamName, "demo-group", "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	for i := 0; i < 5; i++ {
 		messageID, err := producer.PublishMessage(ctx, "demo", map[string]interface{}{

@@ -101,7 +101,7 @@ func main() {
 	time.Sleep(time.Second * 2)
 
 	// 创建生产者并发布消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	log.Println("📝 发布消息...")
 	for i := 0; i < 5; i++ {

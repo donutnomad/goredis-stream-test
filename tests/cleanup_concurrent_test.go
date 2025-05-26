@@ -76,7 +76,7 @@ func TestConcurrentAutoCleanup(t *testing.T) {
 	time.Sleep(time.Second * 2)
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 第一轮：发布大量消息，触发清理
 	t.Log("📝 第一轮：发布20条消息，触发多次清理")
@@ -216,7 +216,7 @@ func TestCleanupRaceCondition(t *testing.T) {
 	t.Log("✅ 两个消费者已启动")
 
 	// 创建生产者并发布消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	t.Log("📝 发布10条消息")
 	for i := 0; i < 10; i++ {

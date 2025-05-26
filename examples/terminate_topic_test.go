@@ -45,7 +45,8 @@ func demonstrateTopicTermination(ctx context.Context, rdb *redis.Client) {
 	log.Println("📝 步骤1: 创建消费者并发布大量消息")
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
+	consumer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
 
 	// 发布大量消息
 	log.Println("📤 发布大量测试消息...")
@@ -117,7 +118,7 @@ func demonstrateTopicTermination(ctx context.Context, rdb *redis.Client) {
 	// 第三步：查看topic信息
 	log.Println("📊 步骤3: 查看topic当前状态")
 
-	info, err := producer.GetTopicInfo(ctx)
+	info, err := consumer.GetTopicInfo(ctx)
 	if err != nil {
 		log.Printf("获取topic信息失败: %v", err)
 	} else {
@@ -132,7 +133,7 @@ func demonstrateTopicTermination(ctx context.Context, rdb *redis.Client) {
 	time.Sleep(time.Second * 3)
 
 	// 使用任意一个消息队列实例来终止topic
-	err = producer.TerminateTopic(ctx)
+	err = consumer.TerminateTopic(ctx)
 	if err != nil {
 		log.Printf("终止topic失败: %v", err)
 		return
@@ -156,7 +157,7 @@ func demonstrateTopicTermination(ctx context.Context, rdb *redis.Client) {
 	// 第六步：演示可以重新创建topic
 	log.Println("🔄 步骤6: 演示可以重新创建topic")
 
-	newProducer := queue.NewMessageQueue(rdb, streamName, groupName, "new-producer")
+	newProducer := queue.NewProducer(rdb, streamName)
 	messageID, err := newProducer.PublishMessage(ctx, "email", map[string]interface{}{
 		"to":      "test@example.com",
 		"subject": "重新开始",

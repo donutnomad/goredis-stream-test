@@ -80,7 +80,8 @@ func main() {
 	// 第二步：发布大量消息
 	fmt.Println("📝 步骤2: 发布大量消息")
 
-	producer := queue.NewMessageQueue(rdb, streamName, "group1", "producer")
+	producer := queue.NewProducer(rdb, streamName)
+	consumer := queue.NewMessageQueue(rdb, streamName, "group1", "producer")
 
 	for i := 0; i < 20; i++ {
 		messageID, err := producer.PublishMessage(ctx, "demo", map[string]interface{}{
@@ -105,7 +106,7 @@ func main() {
 
 	// 第四步：检查Stream状态
 	fmt.Println("📝 步骤4: 检查Stream状态")
-	showStreamInfo(ctx, producer)
+	showStreamInfo(ctx, consumer)
 
 	// 第五步：演示手动清理
 	fmt.Println("📝 步骤5: 演示手动清理")
@@ -117,13 +118,13 @@ func main() {
 		MinRetentionTime:  time.Second * 2, // 短保留时间
 		BatchSize:         5,
 	}
-	producer.SetCleanupPolicy(cleanupPolicy)
+	consumer.SetCleanupPolicy(cleanupPolicy)
 
 	// 等待一会儿确保消息足够老
 	fmt.Println("⏳ 等待消息变老...")
 	time.Sleep(time.Second * 3)
 
-	cleaned, err := producer.CleanupMessages(ctx)
+	cleaned, err := consumer.CleanupMessages(ctx)
 	if err != nil {
 		log.Printf("清理消息失败: %v", err)
 	} else {
@@ -132,7 +133,7 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("📝 步骤6: 检查清理后的Stream状态")
-	showStreamInfo(ctx, producer)
+	showStreamInfo(ctx, consumer)
 
 	// 第六步：演示自动清理
 	fmt.Println("📝 步骤7: 演示自动清理")
@@ -159,7 +160,7 @@ func main() {
 	fmt.Println("✅ 启用自动清理的消费者已启动")
 
 	// 发布更多消息观察自动清理
-	autoProducer := queue.NewMessageQueue(rdb, streamName+"-auto", "auto-group", "auto-producer")
+	autoProducer := queue.NewProducer(rdb, streamName+"-auto")
 
 	fmt.Println("📤 发布消息并观察自动清理...")
 	for i := 0; i < 15; i++ {

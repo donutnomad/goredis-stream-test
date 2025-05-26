@@ -41,7 +41,7 @@ func TestACKErrorWhenTopicDeleted(t *testing.T) {
 	}
 
 	// 发布一条消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 	messageID, err := producer.PublishMessage(ctx, "email", map[string]interface{}{
 		"to":      "test@example.com",
 		"subject": "ACK测试",

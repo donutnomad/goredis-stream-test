@@ -52,7 +52,7 @@ func TestConsumerAutoStop(t *testing.T) {
 	time.Sleep(time.Second * 1)
 
 	// 发布一些消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 	for i := 0; i < 3; i++ {
 		messageID, err := producer.PublishMessage(ctx, "test", map[string]interface{}{
 			"index":   i,
@@ -163,7 +163,7 @@ func TestMultipleConsumersAutoStop(t *testing.T) {
 	time.Sleep(time.Second * 1)
 
 	// 发布一些消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 	for i := 0; i < 5; i++ {
 		messageID, err := producer.PublishMessage(ctx, "test", map[string]interface{}{
 			"index":   i,

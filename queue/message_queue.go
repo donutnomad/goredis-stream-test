@@ -122,6 +122,48 @@ type MessageQueue struct {
 	autoStopOnce sync.Once     // 确保只自动停止一次
 }
 
+type Producer struct {
+	client     *redis.Client
+	streamName string
+}
+
+func NewProducer(client *redis.Client, streamName string) *Producer {
+	return &Producer{client, streamName}
+}
+
+func (mq *Producer) PublishMessage(ctx context.Context, msgType string, data map[string]any, metadata map[string]string) (string, error) {
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("序列化data失败: %w", err)
+	}
+
+	metadataBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return "", fmt.Errorf("序列化metadata失败: %w", err)
+	}
+
+	messageID, err := mq.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: mq.streamName,
+		Values: map[string]any{
+			"type":     msgType,
+			"data":     string(dataBytes),
+			"metadata": string(metadataBytes),
+		},
+	}).Result()
+
+	if err != nil {
+		return "", fmt.Errorf("发布消息失败: %w", err)
+	}
+
+	log.Printf("消息已发布: %s, 类型: %s", messageID, msgType)
+	return messageID, nil
+}
+
+// GetTopicInfo 获取topic信息（消息数量、消费者组等）
+func (mq *Producer) GetTopicInfo(ctx context.Context) (*TopicInfo, error) {
+	return getTopicInfo(ctx, mq.client, mq.streamName)
+}
+
 // NewMessageQueue 创建新的消息队列（默认从最新位置开始）
 func NewMessageQueue(client *redis.Client, streamName, groupName, consumerName string) *MessageQueue {
 	return &MessageQueue{
@@ -743,35 +785,6 @@ func isStreamOrGroupDeletedError(err error) bool {
 	return false
 }
 
-// PublishMessage 发布消息
-func (mq *MessageQueue) PublishMessage(ctx context.Context, msgType string, data map[string]interface{}, metadata map[string]string) (string, error) {
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return "", fmt.Errorf("序列化data失败: %w", err)
-	}
-
-	metadataBytes, err := json.Marshal(metadata)
-	if err != nil {
-		return "", fmt.Errorf("序列化metadata失败: %w", err)
-	}
-
-	messageID, err := mq.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: mq.streamName,
-		Values: map[string]interface{}{
-			"type":     msgType,
-			"data":     string(dataBytes),
-			"metadata": string(metadataBytes),
-		},
-	}).Result()
-
-	if err != nil {
-		return "", fmt.Errorf("发布消息失败: %w", err)
-	}
-
-	log.Printf("消息已发布: %s, 类型: %s", messageID, msgType)
-	return messageID, nil
-}
-
 // TerminateTopic 终止整个topic，清空所有消息和消费者组
 func (mq *MessageQueue) TerminateTopic(ctx context.Context) error {
 	log.Printf("开始终止topic: %s", mq.streamName)
@@ -813,57 +826,7 @@ func (mq *MessageQueue) TerminateTopic(ctx context.Context) error {
 
 // GetTopicInfo 获取topic信息（消息数量、消费者组等）
 func (mq *MessageQueue) GetTopicInfo(ctx context.Context) (*TopicInfo, error) {
-	info := &TopicInfo{
-		StreamName: mq.streamName,
-	}
-
-	// 获取Stream信息
-	streamInfo, err := mq.client.XInfoStream(ctx, mq.streamName).Result()
-	if err != nil {
-		if err.Error() == "ERR no such key" {
-			info.Exists = false
-			return info, nil
-		}
-		return nil, fmt.Errorf("获取Stream信息失败: %w", err)
-	}
-
-	info.Exists = true
-	info.Length = streamInfo.Length
-	info.FirstEntryID = streamInfo.FirstEntry.ID
-	info.LastEntryID = streamInfo.LastEntry.ID
-
-	// 获取消费者组信息
-	groups, err := mq.client.XInfoGroups(ctx, mq.streamName).Result()
-	if err != nil {
-		return nil, fmt.Errorf("获取消费者组信息失败: %w", err)
-	}
-
-	info.Groups = make([]GroupInfo, len(groups))
-	for i, group := range groups {
-		info.Groups[i] = GroupInfo{
-			Name:            group.Name,
-			Pending:         group.Pending,
-			LastDeliveredID: group.LastDeliveredID,
-		}
-
-		// 获取消费者信息
-		consumers, err := mq.client.XInfoConsumers(ctx, mq.streamName, group.Name).Result()
-		if err != nil {
-			log.Printf("获取消费者组 %s 的消费者信息失败: %v", group.Name, err)
-			continue
-		}
-
-		info.Groups[i].Consumers = make([]ConsumerInfo, len(consumers))
-		for j, consumer := range consumers {
-			info.Groups[i].Consumers[j] = ConsumerInfo{
-				Name:    consumer.Name,
-				Pending: consumer.Pending,
-				Idle:    consumer.Idle,
-			}
-		}
-	}
-
-	return info, nil
+	return getTopicInfo(ctx, mq.client, mq.streamName)
 }
 
 // TopicInfo topic信息结构
@@ -1153,4 +1116,59 @@ func (mq *MessageQueue) CleanupMessages(ctx context.Context) (int, error) {
 
 	log.Printf("手动清理完成，清理了 %d 条消息", cleaned)
 	return cleaned, nil
+}
+
+// GetTopicInfo 获取topic信息（消息数量、消费者组等）
+func getTopicInfo(ctx context.Context, client *redis.Client, streamName string) (*TopicInfo, error) {
+	info := &TopicInfo{
+		StreamName: streamName,
+	}
+
+	// 获取Stream信息
+	streamInfo, err := client.XInfoStream(ctx, streamName).Result()
+	if err != nil {
+		if err.Error() == "ERR no such key" {
+			info.Exists = false
+			return info, nil
+		}
+		return nil, fmt.Errorf("获取Stream信息失败: %w", err)
+	}
+
+	info.Exists = true
+	info.Length = streamInfo.Length
+	info.FirstEntryID = streamInfo.FirstEntry.ID
+	info.LastEntryID = streamInfo.LastEntry.ID
+
+	// 获取消费者组信息
+	groups, err := client.XInfoGroups(ctx, streamName).Result()
+	if err != nil {
+		return nil, fmt.Errorf("获取消费者组信息失败: %w", err)
+	}
+
+	info.Groups = make([]GroupInfo, len(groups))
+	for i, group := range groups {
+		info.Groups[i] = GroupInfo{
+			Name:            group.Name,
+			Pending:         group.Pending,
+			LastDeliveredID: group.LastDeliveredID,
+		}
+
+		// 获取消费者信息
+		consumers, err := client.XInfoConsumers(ctx, streamName, group.Name).Result()
+		if err != nil {
+			log.Printf("获取消费者组 %s 的消费者信息失败: %v", group.Name, err)
+			continue
+		}
+
+		info.Groups[i].Consumers = make([]ConsumerInfo, len(consumers))
+		for j, consumer := range consumers {
+			info.Groups[i].Consumers[j] = ConsumerInfo{
+				Name:    consumer.Name,
+				Pending: consumer.Pending,
+				Idle:    consumer.Idle,
+			}
+		}
+	}
+
+	return info, nil
 }

@@ -57,7 +57,7 @@ func TestBatchProcessing(t *testing.T) {
 	t.Log("✅ 批量处理消费者已启动")
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "batch-producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 第一轮：发布正好一批的消息（5条）
 	t.Log("📝 第一轮：发布5条消息（正好一批）")
@@ -104,7 +104,7 @@ func TestBatchProcessing(t *testing.T) {
 	// 第三轮：发布少于一批的消息（3条），测试超时处理
 	t.Log("📝 第三轮：发布3条消息（少于一批，测试超时）")
 	for i := 0; i < 3; i++ {
-		messageID, err := producer.PublishMessage(ctx, "batch-test", map[string]interface{}{
+		messageID, err := producer.PublishMessage(ctx, "batch-test", map[string]any{
 			"index":   i,
 			"message": fmt.Sprintf("批量测试消息 %d", i),
 			"round":   3,
@@ -188,7 +188,7 @@ func TestMixedProcessing(t *testing.T) {
 	t.Log("✅ 混合处理消费者已启动")
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "mixed-producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 发布混合类型的消息
 	t.Log("📝 发布混合类型的消息")

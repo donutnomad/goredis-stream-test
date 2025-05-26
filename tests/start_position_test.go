@@ -15,7 +15,7 @@ func TestStartFromEarliest(t *testing.T) {
 	// 创建Redis客户端
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
-		Password: "",
+		Password: "123456",
 		DB:       0,
 	})
 
@@ -34,7 +34,7 @@ func TestStartFromEarliest(t *testing.T) {
 	// 第一步：先发布一些消息（在创建消费者之前）
 	t.Log("📝 步骤1: 先发布历史消息")
 
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	var historicalMessages []string
 	for i := 0; i < 3; i++ {
@@ -122,7 +122,7 @@ func TestStartFromLatest(t *testing.T) {
 	// 第一步：先发布一些消息（在创建消费者之前）
 	t.Log("📝 步骤1: 先发布历史消息")
 
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	for i := 0; i < 3; i++ {
 		messageID, err := producer.PublishMessage(ctx, "email", map[string]interface{}{
@@ -208,7 +208,7 @@ func TestStartFromSpecificID(t *testing.T) {
 	// 第一步：发布一些消息
 	t.Log("📝 步骤1: 发布消息并记录中间的消息ID")
 
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	var messageIDs []string
 	for i := 0; i < 5; i++ {

@@ -39,6 +39,7 @@ func demonstratePendingHandling(ctx context.Context, rdb *redis.Client) {
 	// 第一步：启动一个消费者，让它处理一些消息但不完成
 	log.Println("📝 步骤1: 启动第一个消费者，模拟处理中断")
 
+	producer := queue.NewProducer(rdb, "pending-demo")
 	consumer1 := queue.NewMessageQueue(rdb, "pending-demo", "demo-group", "consumer-1")
 	consumer1.RegisterHandler(handlers.NewEmailHandler())
 	consumer1.RegisterHandler(handlers.NewOrderHandler())
@@ -52,7 +53,7 @@ func demonstratePendingHandling(ctx context.Context, rdb *redis.Client) {
 	// 发布一些消息
 	log.Println("📤 发布测试消息...")
 	for i := 0; i < 5; i++ {
-		messageID, err := consumer1.PublishMessage(ctx, "email", map[string]interface{}{
+		messageID, err := producer.PublishMessage(ctx, "email", map[string]interface{}{
 			"to":      "user@example.com",
 			"subject": "测试邮件",
 			"body":    "这是一个测试邮件",
@@ -80,6 +81,7 @@ func demonstratePendingHandling(ctx context.Context, rdb *redis.Client) {
 	// 第二步：启动第二个消费者，它应该处理pending消息
 	log.Println("🔄 步骤2: 启动第二个消费者，处理pending消息")
 
+	producer2 := queue.NewProducer(rdb, "pending-demo")
 	consumer2 := queue.NewMessageQueue(rdb, "pending-demo", "demo-group", "consumer-2")
 	consumer2.RegisterHandler(handlers.NewEmailHandler())
 	consumer2.RegisterHandler(handlers.NewOrderHandler())
@@ -108,7 +110,7 @@ func demonstratePendingHandling(ctx context.Context, rdb *redis.Client) {
 	// 发布更多消息，让两个消费者竞争处理
 	log.Println("📤 发布更多消息供竞争处理...")
 	for i := 0; i < 10; i++ {
-		messageID, err := consumer2.PublishMessage(ctx, "order", map[string]interface{}{
+		messageID, err := producer2.PublishMessage(ctx, "order", map[string]interface{}{
 			"order_id": "ORDER-" + string(rune(i+1)),
 			"user_id":  "USER-123",
 			"amount":   99.99,

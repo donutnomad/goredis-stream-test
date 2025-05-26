@@ -34,6 +34,7 @@ func main() {
 	log.Println("✅ Redis连接成功")
 
 	// 创建消息队列
+	producer := queue.NewProducer(rdb, "test-stream")
 	mq := queue.NewMessageQueue(rdb, "test-stream", "test-group", "test-consumer")
 
 	// 注册处理器
@@ -54,7 +55,7 @@ func main() {
 	log.Println("📤 发布测试消息...")
 
 	// 发布邮件消息
-	emailID, err := mq.PublishMessage(ctx, "email", map[string]interface{}{
+	emailID, err := producer.PublishMessage(ctx, "email", map[string]interface{}{
 		"to":      "test@example.com",
 		"subject": "测试邮件",
 		"body":    "这是一个测试邮件",
@@ -68,7 +69,7 @@ func main() {
 	}
 
 	// 发布订单消息
-	orderID, err := mq.PublishMessage(ctx, "order", map[string]interface{}{
+	orderID, err := producer.PublishMessage(ctx, "order", map[string]interface{}{
 		"order_id": "TEST-ORDER-001",
 		"user_id":  "USER-123",
 		"amount":   99.99,

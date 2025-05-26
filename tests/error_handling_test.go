@@ -66,7 +66,7 @@ func demonstrateErrorHandling(t *testing.T, ctx context.Context, rdb *redis.Clie
 	// 第三步：发布消息（在消费者启动后）
 	t.Log("📝 步骤3: 发布消息供消费者处理")
 
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 发布一些消息
 	for i := 0; i < 3; i++ {

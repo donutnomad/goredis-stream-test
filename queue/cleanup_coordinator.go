@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/redis/go-redis/v9"
 	"log"
 	"time"
@@ -15,101 +17,52 @@ type CleanupCoordinator struct {
 	streamName string
 	lockKey    string
 	lockTTL    time.Duration
+	rs         *redsync.Redsync
 }
 
 // NewCleanupCoordinator 创建清理协调器
 func NewCleanupCoordinator(client *redis.Client, streamName string) *CleanupCoordinator {
+	// 初始化 redsync
+	pool := goredis.NewPool(client)
+	rs := redsync.New(pool)
+
 	return &CleanupCoordinator{
 		client:     client,
 		streamName: streamName,
 		lockKey:    fmt.Sprintf("cleanup_lock:%s", streamName),
 		lockTTL:    time.Minute * 2, // 锁的TTL为2分钟
+		rs:         rs,
 	}
 }
 
 // TryAcquireCleanupLock 尝试获取清理锁
-func (cc *CleanupCoordinator) TryAcquireCleanupLock(ctx context.Context, consumerName string) (bool, error) {
-	// 使用Redis SET命令的NX选项实现分布式锁
-	result, err := cc.client.SetNX(ctx, cc.lockKey, consumerName, cc.lockTTL).Result()
+func (cc *CleanupCoordinator) TryAcquireCleanupLock(ctx context.Context, consumerName string) (*AutoExtendMutex, bool, error) {
+	// 使用 redsync 创建互斥锁
+	mutex := cc.rs.NewMutex(cc.lockKey,
+		redsync.WithExpiry(cc.lockTTL),
+		redsync.WithTries(1), // 只尝试一次
+		redsync.WithValue(consumerName),
+	)
+
+	// 创建自动续期的互斥锁
+	autoMutex := NewAutoExtendMutex(mutex, cc.lockTTL/2)
+
+	// 尝试获取锁
+	err := autoMutex.LockContext(ctx)
 	if err != nil {
-		return false, fmt.Errorf("获取清理锁失败: %w", err)
+		// 如果获取锁失败，检查锁的持有者
+		holder, getErr := cc.client.Get(ctx, cc.lockKey).Result()
+		if getErr != nil && !errors.Is(getErr, redis.Nil) {
+			log.Printf("检查锁持有者失败: %v", getErr)
+		} else if !errors.Is(getErr, redis.Nil) {
+			log.Printf("清理锁被 %s 持有，跳过清理", holder)
+		}
+
+		return nil, false, fmt.Errorf("获取清理锁失败: %w", err)
 	}
 
-	if result {
-		log.Printf("消费者 %s 获取到清理锁", consumerName)
-		return true, nil
-	}
-
-	// 检查锁的持有者
-	holder, err := cc.client.Get(ctx, cc.lockKey).Result()
-	if err != nil && !errors.Is(err, redis.Nil) {
-		log.Printf("检查锁持有者失败: %v", err)
-	} else if !errors.Is(err, redis.Nil) {
-		log.Printf("清理锁被 %s 持有，跳过清理", holder)
-	}
-
-	return false, nil
-}
-
-// ReleaseCleanupLock 释放清理锁
-func (cc *CleanupCoordinator) ReleaseCleanupLock(ctx context.Context, consumerName string) error {
-	// 使用Lua脚本确保只有锁的持有者才能释放锁
-	luaScript := `
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("DEL", KEYS[1])
-		else
-			return 0
-		end
-	`
-
-	result, err := cc.client.Eval(ctx, luaScript, []string{cc.lockKey}, consumerName).Result()
-	if err != nil {
-		return fmt.Errorf("释放清理锁失败: %w", err)
-	}
-
-	if result.(int64) == 1 {
-		log.Printf("消费者 %s 释放清理锁", consumerName)
-	} else {
-		log.Printf("消费者 %s 无法释放清理锁（可能已过期或被其他消费者持有）", consumerName)
-	}
-
-	return nil
-}
-
-// ExtendCleanupLock 延长清理锁的TTL
-func (cc *CleanupCoordinator) ExtendCleanupLock(ctx context.Context, consumerName string) error {
-	// 使用Lua脚本确保只有锁的持有者才能延长TTL
-	luaScript := `
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("EXPIRE", KEYS[1], ARGV[2])
-		else
-			return 0
-		end
-	`
-
-	result, err := cc.client.Eval(ctx, luaScript, []string{cc.lockKey}, consumerName, int(cc.lockTTL.Seconds())).Result()
-	if err != nil {
-		return fmt.Errorf("延长清理锁失败: %w", err)
-	}
-
-	if result.(int64) == 1 {
-		log.Printf("消费者 %s 延长清理锁TTL", consumerName)
-	}
-
-	return nil
-}
-
-// IsCleanupInProgress 检查是否有清理操作正在进行
-func (cc *CleanupCoordinator) IsCleanupInProgress(ctx context.Context) (bool, string, error) {
-	holder, err := cc.client.Get(ctx, cc.lockKey).Result()
-	if errors.Is(err, redis.Nil) {
-		return false, "", nil
-	}
-	if err != nil {
-		return false, "", fmt.Errorf("检查清理状态失败: %w", err)
-	}
-
-	return true, holder, nil
+	log.Printf("消费者 %s 获取到清理锁", consumerName)
+	return autoMutex, true, nil
 }
 
 // GetCleanupStats 获取清理统计信息
@@ -151,6 +104,19 @@ func (cc *CleanupCoordinator) UpdateCleanupStats(ctx context.Context, consumerNa
 	return nil
 }
 
+// IsCleanupInProgress 检查是否有清理操作正在进行
+func (cc *CleanupCoordinator) IsCleanupInProgress(ctx context.Context) (bool, string, error) {
+	holder, err := cc.client.Get(ctx, cc.lockKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, "", nil
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("检查清理状态失败: %w", err)
+	}
+
+	return true, holder, nil
+}
+
 // CleanupStats 清理统计信息
 type CleanupStats struct {
 	StreamName string            `json:"stream_name"`
@@ -162,7 +128,7 @@ func (mq *MessageQueue) CoordinatedCleanup(ctx context.Context) (int, error) {
 	coordinator := NewCleanupCoordinator(mq.client, mq.streamName)
 
 	// 尝试获取清理锁
-	acquired, err := coordinator.TryAcquireCleanupLock(ctx, mq.consumerName)
+	mutex, acquired, err := coordinator.TryAcquireCleanupLock(ctx, mq.consumerName)
 	if err != nil {
 		return 0, fmt.Errorf("获取清理锁失败: %w", err)
 	}
@@ -174,8 +140,10 @@ func (mq *MessageQueue) CoordinatedCleanup(ctx context.Context) (int, error) {
 
 	// 确保释放锁
 	defer func() {
-		if err := coordinator.ReleaseCleanupLock(ctx, mq.consumerName); err != nil {
-			log.Printf("释放清理锁失败: %v", err)
+		if mutex != nil {
+			if _, err := mutex.Unlock(); err != nil {
+				log.Printf("释放清理锁失败: %v", err)
+			}
 		}
 	}()
 

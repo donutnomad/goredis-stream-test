@@ -58,10 +58,11 @@ func TestMessageCleanup(t *testing.T) {
 	t.Log("📝 步骤2: 发布测试消息")
 
 	producer := queue.NewMessageQueue(rdb, streamName, groupName1, "producer")
+	producer2 := queue.NewProducer(rdb, streamName)
 
 	var messageIDs []string
 	for i := 0; i < 10; i++ {
-		messageID, err := producer.PublishMessage(ctx, "test", map[string]interface{}{
+		messageID, err := producer2.PublishMessage(ctx, "test", map[string]interface{}{
 			"index":   i,
 			"message": "测试消息",
 		}, map[string]string{
@@ -174,7 +175,7 @@ func TestAutoCleanup(t *testing.T) {
 	t.Log("✅ 启用自动清理的消费者已启动")
 
 	// 发布消息
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	t.Log("📝 发布消息并观察自动清理")
 	for i := 0; i < 15; i++ {

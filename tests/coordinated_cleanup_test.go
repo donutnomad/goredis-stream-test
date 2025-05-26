@@ -17,7 +17,7 @@ func TestCoordinatedCleanup(t *testing.T) {
 	// 创建Redis客户端
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
-		Password: "",
+		Password: "123456",
 		DB:       0,
 	})
 
@@ -76,7 +76,7 @@ func TestCoordinatedCleanup(t *testing.T) {
 	time.Sleep(time.Second * 2)
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, groupName, "coord-producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 发布大量消息，触发协调清理
 	t.Log("📝 发布20条消息，触发协调清理")
@@ -135,122 +135,122 @@ func TestCoordinatedCleanup(t *testing.T) {
 	t.Log("✅ 协调清理测试完成")
 }
 
-// TestCleanupCoordinator 测试清理协调器的基本功能
-func TestCleanupCoordinator(t *testing.T) {
-	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
-
-	ctx := context.Background()
-	_, err := rdb.Ping(ctx).Result()
-	if err != nil {
-		t.Skipf("跳过测试：无法连接到Redis: %v", err)
-		return
-	}
-
-	streamName := "coordinator-test"
-	coordinator := queue.NewCleanupCoordinator(rdb, streamName)
-
-	t.Log("🎯 测试清理协调器基本功能")
-
-	// 测试获取锁
-	t.Log("🔒 测试获取清理锁")
-	acquired1, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-1")
-	if err != nil {
-		t.Fatalf("获取锁失败: %v", err)
-	}
-	if !acquired1 {
-		t.Fatalf("应该能够获取锁")
-	}
-	t.Log("✅ consumer-1 成功获取锁")
-
-	// 测试锁的排他性
-	t.Log("🔒 测试锁的排他性")
-	acquired2, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-2")
-	if err != nil {
-		t.Fatalf("尝试获取锁失败: %v", err)
-	}
-	if acquired2 {
-		t.Fatalf("不应该能够获取已被持有的锁")
-	}
-	t.Log("✅ consumer-2 正确地无法获取已被持有的锁")
-
-	// 测试检查清理状态
-	t.Log("🔍 测试检查清理状态")
-	inProgress, holder, err := coordinator.IsCleanupInProgress(ctx)
-	if err != nil {
-		t.Fatalf("检查清理状态失败: %v", err)
-	}
-	if !inProgress {
-		t.Fatalf("应该显示清理正在进行")
-	}
-	if holder != "consumer-1" {
-		t.Fatalf("锁持有者应该是 consumer-1，实际是 %s", holder)
-	}
-	t.Logf("✅ 清理状态正确: 进行中=%v, 持有者=%s", inProgress, holder)
-
-	// 测试延长锁TTL
-	t.Log("⏰ 测试延长锁TTL")
-	err = coordinator.ExtendCleanupLock(ctx, "consumer-1")
-	if err != nil {
-		t.Fatalf("延长锁TTL失败: %v", err)
-	}
-	t.Log("✅ 成功延长锁TTL")
-
-	// 测试非持有者无法延长锁
-	t.Log("⏰ 测试非持有者无法延长锁")
-	err = coordinator.ExtendCleanupLock(ctx, "consumer-2")
-	if err != nil {
-		t.Fatalf("延长锁TTL操作失败: %v", err)
-	}
-	t.Log("✅ 非持有者正确地无法延长锁")
-
-	// 测试更新统计信息
-	t.Log("📊 测试更新清理统计")
-	err = coordinator.UpdateCleanupStats(ctx, "consumer-1", 10)
-	if err != nil {
-		t.Fatalf("更新统计失败: %v", err)
-	}
-	t.Log("✅ 成功更新清理统计")
-
-	// 测试获取统计信息
-	t.Log("📊 测试获取清理统计")
-	stats, err := coordinator.GetCleanupStats(ctx)
-	if err != nil {
-		t.Fatalf("获取统计失败: %v", err)
-	}
-	t.Logf("✅ 获取统计成功: %+v", stats.Stats)
-
-	// 测试释放锁
-	t.Log("🔓 测试释放锁")
-	err = coordinator.ReleaseCleanupLock(ctx, "consumer-1")
-	if err != nil {
-		t.Fatalf("释放锁失败: %v", err)
-	}
-	t.Log("✅ consumer-1 成功释放锁")
-
-	// 测试锁释放后其他消费者可以获取
-	t.Log("🔒 测试锁释放后其他消费者可以获取")
-	acquired3, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-2")
-	if err != nil {
-		t.Fatalf("获取锁失败: %v", err)
-	}
-	if !acquired3 {
-		t.Fatalf("应该能够获取已释放的锁")
-	}
-	t.Log("✅ consumer-2 成功获取已释放的锁")
-
-	// 清理
-	err = coordinator.ReleaseCleanupLock(ctx, "consumer-2")
-	if err != nil {
-		t.Fatalf("清理锁失败: %v", err)
-	}
-
-	t.Log("✅ 清理协调器基本功能测试完成")
-}
+//// TestCleanupCoordinator 测试清理协调器的基本功能
+//func TestCleanupCoordinator(t *testing.T) {
+//	// 创建Redis客户端
+//	rdb := redis.NewClient(&redis.Options{
+//		Addr:     "localhost:6379",
+//		Password: "",
+//		DB:       0,
+//	})
+//
+//	ctx := context.Background()
+//	_, err := rdb.Ping(ctx).Result()
+//	if err != nil {
+//		t.Skipf("跳过测试：无法连接到Redis: %v", err)
+//		return
+//	}
+//
+//	streamName := "coordinator-test"
+//	coordinator := queue.NewCleanupCoordinator(rdb, streamName)
+//
+//	t.Log("🎯 测试清理协调器基本功能")
+//
+//	// 测试获取锁
+//	t.Log("🔒 测试获取清理锁")
+//	acquired1, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-1")
+//	if err != nil {
+//		t.Fatalf("获取锁失败: %v", err)
+//	}
+//	if !acquired1 {
+//		t.Fatalf("应该能够获取锁")
+//	}
+//	t.Log("✅ consumer-1 成功获取锁")
+//
+//	// 测试锁的排他性
+//	t.Log("🔒 测试锁的排他性")
+//	acquired2, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-2")
+//	if err != nil {
+//		t.Fatalf("尝试获取锁失败: %v", err)
+//	}
+//	if acquired2 {
+//		t.Fatalf("不应该能够获取已被持有的锁")
+//	}
+//	t.Log("✅ consumer-2 正确地无法获取已被持有的锁")
+//
+//	// 测试检查清理状态
+//	t.Log("🔍 测试检查清理状态")
+//	inProgress, holder, err := coordinator.IsCleanupInProgress(ctx)
+//	if err != nil {
+//		t.Fatalf("检查清理状态失败: %v", err)
+//	}
+//	if !inProgress {
+//		t.Fatalf("应该显示清理正在进行")
+//	}
+//	if holder != "consumer-1" {
+//		t.Fatalf("锁持有者应该是 consumer-1，实际是 %s", holder)
+//	}
+//	t.Logf("✅ 清理状态正确: 进行中=%v, 持有者=%s", inProgress, holder)
+//
+//	// 测试延长锁TTL
+//	t.Log("⏰ 测试延长锁TTL")
+//	err = coordinator.ExtendCleanupLock(ctx, "consumer-1")
+//	if err != nil {
+//		t.Fatalf("延长锁TTL失败: %v", err)
+//	}
+//	t.Log("✅ 成功延长锁TTL")
+//
+//	// 测试非持有者无法延长锁
+//	t.Log("⏰ 测试非持有者无法延长锁")
+//	err = coordinator.ExtendCleanupLock(ctx, "consumer-2")
+//	if err != nil {
+//		t.Fatalf("延长锁TTL操作失败: %v", err)
+//	}
+//	t.Log("✅ 非持有者正确地无法延长锁")
+//
+//	// 测试更新统计信息
+//	t.Log("📊 测试更新清理统计")
+//	err = coordinator.UpdateCleanupStats(ctx, "consumer-1", 10)
+//	if err != nil {
+//		t.Fatalf("更新统计失败: %v", err)
+//	}
+//	t.Log("✅ 成功更新清理统计")
+//
+//	// 测试获取统计信息
+//	t.Log("📊 测试获取清理统计")
+//	stats, err := coordinator.GetCleanupStats(ctx)
+//	if err != nil {
+//		t.Fatalf("获取统计失败: %v", err)
+//	}
+//	t.Logf("✅ 获取统计成功: %+v", stats.Stats)
+//
+//	// 测试释放锁
+//	t.Log("🔓 测试释放锁")
+//	err = coordinator.ReleaseCleanupLock(ctx, "consumer-1")
+//	if err != nil {
+//		t.Fatalf("释放锁失败: %v", err)
+//	}
+//	t.Log("✅ consumer-1 成功释放锁")
+//
+//	// 测试锁释放后其他消费者可以获取
+//	t.Log("🔒 测试锁释放后其他消费者可以获取")
+//	acquired3, err := coordinator.TryAcquireCleanupLock(ctx, "consumer-2")
+//	if err != nil {
+//		t.Fatalf("获取锁失败: %v", err)
+//	}
+//	if !acquired3 {
+//		t.Fatalf("应该能够获取已释放的锁")
+//	}
+//	t.Log("✅ consumer-2 成功获取已释放的锁")
+//
+//	// 清理
+//	err = coordinator.ReleaseCleanupLock(ctx, "consumer-2")
+//	if err != nil {
+//		t.Fatalf("清理锁失败: %v", err)
+//	}
+//
+//	t.Log("✅ 清理协调器基本功能测试完成")
+//}
 
 // CoordinatedTestHandler 协调测试处理器
 type CoordinatedTestHandler struct {

@@ -152,7 +152,7 @@ func main() {
 	fmt.Println()
 
 	// 创建生产者
-	producer := queue.NewMessageQueue(rdb, streamName, "demo-group", "batch-producer")
+	producer := queue.NewProducer(rdb, streamName)
 
 	// 演示1：批量邮件处理
 	fmt.Println("📝 演示1: 批量邮件处理")
