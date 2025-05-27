@@ -3,11 +3,12 @@ package queue
 import (
 	"context"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"log"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // extractTimestampFromMessageID 从消息ID中提取时间戳
@@ -75,8 +76,11 @@ func isMessageOldEnough(messageID string, minRetentionTime time.Duration) bool {
 		log.Printf("提取消息时间戳失败 %s: %v", messageID, err)
 		return false
 	}
-	messageTime := time.Unix(timestamp/1000, (timestamp%1000)*1000000)
-	return time.Since(messageTime) >= minRetentionTime
+	return time.Since(MillisToTime(timestamp)) >= minRetentionTime
+}
+
+func MillisToTime(millis int64) time.Time {
+	return time.Unix(millis/1000, (millis%1000)*int64(time.Millisecond))
 }
 
 // GetTopicInfo 获取topic信息（消息数量、消费者组等）
@@ -132,4 +136,49 @@ func getTopicInfo(ctx context.Context, client *redis.Client, streamName string) 
 	}
 
 	return info, nil
+}
+
+func excludeID(id string) string {
+	return "(" + id // 使用 ( 前缀表示不包含该ID，即从该ID之后的消息开始
+}
+
+type Slices[T any] []T
+
+func (s Slices[T]) Last() T {
+	return s[len(s)-1]
+}
+
+// isStreamOrGroupDeletedError 检查错误是否是因为Stream或消费者组被删除
+func isStreamOrGroupDeletedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// NOGROUP No such key 'error-demo-test' or consumer group 'error-group-test' in XREADGROUP with GROUP option
+	// 常见的错误模式
+	patterns := []string{
+		"ERR no such key",
+		"NOGROUP",
+		"No such key",
+		"consumer group",
+		"does not exist",
+	}
+
+	for _, pattern := range patterns {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func extractIds(messages []*Message) []string {
+	ids := make([]string, 0, len(messages))
+	for _, message := range messages {
+		ids = append(ids, message.ID)
+	}
+	return ids
 }

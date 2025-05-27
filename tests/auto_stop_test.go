@@ -8,18 +8,12 @@ import (
 	"time"
 
 	"goStream/queue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // TestConsumerAutoStop 测试消费者自动停止功能
 func TestConsumerAutoStop(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -118,11 +112,7 @@ func TestConsumerAutoStop(t *testing.T) {
 // TestMultipleConsumersAutoStop 测试多个消费者的自动停止
 func TestMultipleConsumersAutoStop(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -234,11 +224,7 @@ func TestMultipleConsumersAutoStop(t *testing.T) {
 // TestAutoStopVsManualStop 测试自动停止与手动停止的区别
 func TestAutoStopVsManualStop(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()

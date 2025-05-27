@@ -8,18 +8,12 @@ import (
 	"time"
 
 	"goStream/queue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // TestConcurrentAutoCleanup 测试多个消费者同时开启自动清理的竞争问题
 func TestConcurrentAutoCleanup(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -51,7 +45,7 @@ func TestConcurrentAutoCleanup(t *testing.T) {
 	for i := 0; i < numConsumers; i++ {
 		consumerName := fmt.Sprintf("consumer-%d", i)
 		consumer := queue.NewMessageQueue(rdb, streamName, groupName, consumerName)
-		consumer.SetCleanupPolicy(cleanupPolicy)
+		consumer.GetCleaner().SetCleanupPolicy(cleanupPolicy)
 
 		// 注册处理器
 		handler := &ConcurrentTestHandler{t: t, name: consumerName}
@@ -162,11 +156,7 @@ func TestConcurrentAutoCleanup(t *testing.T) {
 // TestCleanupRaceCondition 测试清理操作的竞争条件
 func TestCleanupRaceCondition(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -192,8 +182,8 @@ func TestCleanupRaceCondition(t *testing.T) {
 	consumer1 := queue.NewMessageQueue(rdb, streamName, groupName, "consumer-1")
 	consumer2 := queue.NewMessageQueue(rdb, streamName, groupName, "consumer-2")
 
-	consumer1.SetCleanupPolicy(cleanupPolicy)
-	consumer2.SetCleanupPolicy(cleanupPolicy)
+	consumer1.GetCleaner().SetCleanupPolicy(cleanupPolicy)
+	consumer2.GetCleaner().SetCleanupPolicy(cleanupPolicy)
 
 	// 注册处理器
 	handler1 := &ConcurrentTestHandler{t: t, name: "consumer-1"}
@@ -241,7 +231,7 @@ func TestCleanupRaceCondition(t *testing.T) {
 	t.Log("🔄 同时触发两个消费者的手动清理")
 
 	var wg sync.WaitGroup
-	var cleaned1, cleaned2 int
+	var cleaned1, cleaned2 int64
 	var err1, err2 error
 
 	wg.Add(2)
@@ -249,7 +239,7 @@ func TestCleanupRaceCondition(t *testing.T) {
 	// 消费者1执行清理
 	go func() {
 		defer wg.Done()
-		cleaned1, err1 = consumer1.CleanupMessages(ctx)
+		cleaned1, err1 = consumer1.GetCleaner().CleanupMessages(ctx)
 		t.Logf("🧹 消费者1清理结果: %d 条消息, 错误: %v", cleaned1, err1)
 	}()
 
@@ -257,7 +247,7 @@ func TestCleanupRaceCondition(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		time.Sleep(time.Millisecond * 10) // 稍微错开一点
-		cleaned2, err2 = consumer2.CleanupMessages(ctx)
+		cleaned2, err2 = consumer2.GetCleaner().CleanupMessages(ctx)
 		t.Logf("🧹 消费者2清理结果: %d 条消息, 错误: %v", cleaned2, err2)
 	}()
 

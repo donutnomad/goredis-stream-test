@@ -13,11 +13,7 @@ import (
 // TestMessageCleanup 测试消息清理功能
 func TestMessageCleanup(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -104,12 +100,12 @@ func TestMessageCleanup(t *testing.T) {
 		MinRetentionTime:  time.Second * 1, // 短保留时间便于测试
 		BatchSize:         5,
 	}
-	producer.SetCleanupPolicy(cleanupPolicy)
+	producer.GetCleaner().SetCleanupPolicy(cleanupPolicy)
 
 	// 等待一会儿确保消息足够老
 	time.Sleep(time.Second * 2)
 
-	cleaned, err := producer.CleanupMessages(ctx)
+	cleaned, err := producer.GetCleaner().CleanupMessages(ctx)
 	if err != nil {
 		t.Errorf("清理消息失败: %v", err)
 	} else {
@@ -132,14 +128,18 @@ func TestMessageCleanup(t *testing.T) {
 	t.Log("✅ 消息清理测试完成")
 }
 
+func getRDB() *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "123456",
+		DB:       0,
+	})
+}
+
 // TestAutoCleanup 测试自动清理功能
 func TestAutoCleanup(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -165,7 +165,7 @@ func TestAutoCleanup(t *testing.T) {
 		MinRetentionTime:  time.Second * 1, // 短保留时间
 		BatchSize:         3,
 	}
-	consumer.SetCleanupPolicy(cleanupPolicy)
+	consumer.GetCleaner().SetCleanupPolicy(cleanupPolicy)
 
 	err = consumer.Start(ctx)
 	if err != nil {

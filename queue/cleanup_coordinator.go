@@ -22,10 +22,8 @@ type CleanupCoordinator struct {
 
 // NewCleanupCoordinator 创建清理协调器
 func NewCleanupCoordinator(client *redis.Client, streamName string) *CleanupCoordinator {
-	// 初始化 redsync
 	pool := goredis.NewPool(client)
 	rs := redsync.New(pool)
-
 	return &CleanupCoordinator{
 		client:     client,
 		streamName: streamName,
@@ -71,7 +69,7 @@ func (cc *CleanupCoordinator) GetCleanupStats(ctx context.Context) (*CleanupStat
 
 	stats, err := cc.client.HGetAll(ctx, statsKey).Result()
 	if err != nil {
-		return nil, fmt.Errorf("获取清理统计失败: %w", err)
+		return nil, fmt.Errorf("[cleaner] call HGetAll failed: %w", err)
 	}
 
 	cleanupStats := &CleanupStats{
@@ -83,23 +81,21 @@ func (cc *CleanupCoordinator) GetCleanupStats(ctx context.Context) (*CleanupStat
 }
 
 // UpdateCleanupStats 更新清理统计信息
-func (cc *CleanupCoordinator) UpdateCleanupStats(ctx context.Context, consumerName string, cleaned int) error {
+func (cc *CleanupCoordinator) UpdateCleanupStats(ctx context.Context, consumerName string, cleaned int64) error {
 	statsKey := fmt.Sprintf("cleanup_stats:%s", cc.streamName)
 	now := time.Now().Format(time.RFC3339)
 
 	pipe := cc.client.Pipeline()
-	pipe.HIncrBy(ctx, statsKey, "total_cleaned", int64(cleaned))
+	pipe.HIncrBy(ctx, statsKey, "total_cleaned", cleaned)
 	pipe.HIncrBy(ctx, statsKey, "cleanup_count", 1)
 	pipe.HSet(ctx, statsKey, "last_cleanup_time", now)
 	pipe.HSet(ctx, statsKey, "last_cleanup_by", consumerName)
 	pipe.HSet(ctx, statsKey, "last_cleaned_count", cleaned)
 	pipe.Expire(ctx, statsKey, time.Hour*24*7) // 统计信息保留7天
-
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("更新清理统计失败: %w", err)
+		return fmt.Errorf("[cleaner] update cleanup stats failed: %w", err)
 	}
-
 	log.Printf("更新清理统计: 消费者=%s, 清理数量=%d", consumerName, cleaned)
 	return nil
 }

@@ -8,18 +8,12 @@ import (
 	"time"
 
 	"goStream/queue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // TestCoordinatedCleanup 测试协调清理功能
 func TestCoordinatedCleanup(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "123456",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -51,7 +45,7 @@ func TestCoordinatedCleanup(t *testing.T) {
 	for i := 0; i < numConsumers; i++ {
 		consumerName := fmt.Sprintf("coord-consumer-%d", i)
 		consumer := queue.NewMessageQueue(rdb, streamName, groupName, consumerName)
-		consumer.SetCleanupPolicy(cleanupPolicy)
+		consumer.GetCleaner().SetCleanupPolicy(cleanupPolicy)
 
 		// 注册处理器
 		handler := &CoordinatedTestHandler{t: t, name: consumerName}

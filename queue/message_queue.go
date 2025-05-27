@@ -6,19 +6,52 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/samber/lo"
 )
+
+// ILogger 日志接口
+type ILogger interface {
+	Printf(format string, v ...interface{})
+}
+
+// defaultLogger 默认日志实现，使用标准库log
+type defaultLogger struct{}
+
+func (l *defaultLogger) Printf(format string, v ...interface{}) {
+	log.Printf(format, v...)
+}
+
+// loggerWrapper 日志包装器，添加前缀
+type loggerWrapper struct {
+	logger ILogger
+	prefix string
+}
+
+func newLoggerWrapper(logger ILogger, prefix string) *loggerWrapper {
+	return &loggerWrapper{
+		logger: logger,
+		prefix: prefix,
+	}
+}
+
+func (w *loggerWrapper) Printf(format string, v ...interface{}) {
+	w.logger.Printf(w.prefix+" "+format, v...)
+}
 
 // Message 消息结构
 type Message struct {
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"`
-	Data     map[string]interface{} `json:"data"`
-	Metadata map[string]string      `json:"metadata"`
+	ID       string                 `json:"id"`       // 消息ID，来自Redis的消息ID
+	Type     string                 `json:"type"`     // 消息类型
+	Data     map[string]interface{} `json:"data"`     // 消息数据
+	Metadata map[string]string      `json:"metadata"` // 消息元数据
 }
 
 // MessageHandler 消息处理器接口
@@ -94,6 +127,13 @@ func DefaultBatchConfig() *BatchConfig {
 	}
 }
 
+// RedisMessagePayload Redis消息载荷结构
+type RedisMessagePayload struct {
+	Type     string                 `json:"type"`
+	Data     map[string]interface{} `json:"data"`
+	Metadata map[string]string      `json:"metadata"`
+}
+
 // MessageQueue Redis Stream消息队列
 type MessageQueue struct {
 	client       *redis.Client
@@ -109,110 +149,83 @@ type MessageQueue struct {
 	stopped      bool
 
 	// 清理策略
-	cleanupPolicy *CleanupPolicy
+	cleaner *MessageCleaner
 
 	// 批量处理相关
 	batchHandlers map[string]BatchMessageHandler
 	batchConfig   *BatchConfig
 
 	// 自动停止相关
-	doneChan     chan struct{} // 用于通知外部消费者已停止
-	autoStopped  bool          // 标记是否因为topic删除而自动停止
-	autoStopOnce sync.Once     // 确保只自动停止一次
+	doneChan    chan struct{} // 用于通知外部消费者已停止
+	autoStopped bool          // 标记是否因为topic删除而自动停止
+
+	// 日志
+	logger ILogger
+
+	// 重试相关
+	maxRetries int // 最大重试次数，默认为3
 }
 
-type Producer struct {
-	client     *redis.Client
-	streamName string
-}
+// MessageQueueOption 消息队列配置选项
+type MessageQueueOption func(*MessageQueue)
 
-func NewProducer(client *redis.Client, streamName string) *Producer {
-	return &Producer{client, streamName}
-}
-
-func (mq *Producer) PublishMessage(ctx context.Context, msgType string, data map[string]any, metadata map[string]string) (string, error) {
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return "", fmt.Errorf("序列化data失败: %w", err)
-	}
-
-	metadataBytes, err := json.Marshal(metadata)
-	if err != nil {
-		return "", fmt.Errorf("序列化metadata失败: %w", err)
-	}
-
-	messageID, err := mq.client.XAdd(ctx, &redis.XAddArgs{
-		Stream: mq.streamName,
-		Values: map[string]any{
-			"type":     msgType,
-			"data":     string(dataBytes),
-			"metadata": string(metadataBytes),
-		},
-	}).Result()
-
-	if err != nil {
-		return "", fmt.Errorf("发布消息失败: %w", err)
-	}
-
-	log.Printf("消息已发布: %s, 类型: %s", messageID, msgType)
-	return messageID, nil
-}
-
-// GetTopicInfo 获取topic信息（消息数量、消费者组等）
-func (mq *Producer) GetTopicInfo(ctx context.Context) (*TopicInfo, error) {
-	return getTopicInfo(ctx, mq.client, mq.streamName)
-}
-
-// NewMessageQueue 创建新的消息队列（默认从最新位置开始）
-func NewMessageQueue(client *redis.Client, streamName, groupName, consumerName string) *MessageQueue {
-	return &MessageQueue{
-		client:        client,
-		streamName:    streamName,
-		groupName:     groupName,
-		consumerName:  consumerName,
-		startPos:      StartFromLatest, // 默认从最新位置开始
-		handlers:      make(map[string]MessageHandler),
-		stopChan:      make(chan struct{}),
-		cleanupPolicy: DefaultCleanupPolicy(),
-		batchHandlers: make(map[string]BatchMessageHandler),
-		batchConfig:   DefaultBatchConfig(),
-		doneChan:      make(chan struct{}),
+// WithLogger 设置自定义日志器
+func WithLogger(logger ILogger) MessageQueueOption {
+	return func(mq *MessageQueue) {
+		// 使用包装器包装传入的logger
+		mq.logger = newLoggerWrapper(logger, "[mq]")
 	}
 }
 
-// NewMessageQueueWithStartPosition 创建新的消息队列并指定开始位置
-func NewMessageQueueWithStartPosition(client *redis.Client, streamName, groupName, consumerName string, startPos StartPosition) *MessageQueue {
-	return &MessageQueue{
+// WithBatchConfig 设置批量处理配置
+func WithBatchConfig(config *BatchConfig) MessageQueueOption {
+	return func(mq *MessageQueue) {
+		mq.batchConfig = config
+	}
+}
+
+func newMessageQueue(client *redis.Client, streamName, groupName, consumerName string, startPos StartPosition, specificID string, options ...MessageQueueOption) *MessageQueue {
+	cleaner := NewMessageCleaner(client, streamName, consumerName)
+	baseLogger := &defaultLogger{}
+	wrappedLogger := newLoggerWrapper(baseLogger, "[mq]")
+	mq := &MessageQueue{
 		client:        client,
 		streamName:    streamName,
 		groupName:     groupName,
 		consumerName:  consumerName,
 		startPos:      startPos,
+		specificID:    specificID,
 		handlers:      make(map[string]MessageHandler),
 		stopChan:      make(chan struct{}),
-		cleanupPolicy: DefaultCleanupPolicy(),
+		cleaner:       cleaner,
 		batchHandlers: make(map[string]BatchMessageHandler),
 		batchConfig:   DefaultBatchConfig(),
 		doneChan:      make(chan struct{}),
+		logger:        wrappedLogger,
 	}
+	for _, option := range options {
+		option(mq)
+	}
+	return mq
+}
+
+// NewMessageQueue 创建新的消息队列（默认从最新位置开始）
+func NewMessageQueue(client *redis.Client, streamName, groupName, consumerName string, options ...MessageQueueOption) *MessageQueue {
+	return newMessageQueue(client, streamName, groupName, consumerName, StartFromLatest, "", options...)
+}
+
+// NewMessageQueueWithStartPosition 创建新的消息队列并指定开始位置
+func NewMessageQueueWithStartPosition(client *redis.Client, streamName, groupName, consumerName string, startPos StartPosition, options ...MessageQueueOption) *MessageQueue {
+	return newMessageQueue(client, streamName, groupName, consumerName, startPos, "", options...)
 }
 
 // NewMessageQueueFromSpecificID 创建新的消息队列并从指定消息ID开始
-func NewMessageQueueFromSpecificID(client *redis.Client, streamName, groupName, consumerName string, messageID string) *MessageQueue {
-	return &MessageQueue{
-		client:        client,
-		streamName:    streamName,
-		groupName:     groupName,
-		consumerName:  consumerName,
-		startPos:      StartFromSpecific,
-		specificID:    messageID,
-		handlers:      make(map[string]MessageHandler),
-		stopChan:      make(chan struct{}),
-		cleanupPolicy: DefaultCleanupPolicy(),
-		batchHandlers: make(map[string]BatchMessageHandler),
-		batchConfig:   DefaultBatchConfig(),
-		doneChan:      make(chan struct{}),
-	}
+func NewMessageQueueFromSpecificID(client *redis.Client, streamName, groupName, consumerName string, messageID string, options ...MessageQueueOption) *MessageQueue {
+	return newMessageQueue(client, streamName, groupName, consumerName, StartFromSpecific, messageID, options...)
+}
+
+func (mq *MessageQueue) GetCleaner() *MessageCleaner {
+	return mq.cleaner
 }
 
 // RegisterHandler 注册消息处理器
@@ -260,33 +273,6 @@ func (mq *MessageQueue) IsAutoStopped() bool {
 	return mq.autoStopped
 }
 
-// autoStop 自动停止消费者（因为topic被删除）
-func (mq *MessageQueue) autoStop(reason string) {
-	mq.autoStopOnce.Do(func() {
-		mq.mu.Lock()
-		if mq.stopped {
-			mq.mu.Unlock()
-			return
-		}
-		mq.autoStopped = true
-		mq.stopped = true
-		mq.mu.Unlock()
-
-		log.Printf("消费者 %s 自动停止: %s", mq.consumerName, reason)
-
-		// 关闭stopChan以停止所有goroutine
-		close(mq.stopChan)
-
-		// 关闭doneChan通知外部
-		close(mq.doneChan)
-
-		// 等待所有goroutine结束
-		mq.wg.Wait()
-
-		log.Printf("消费者 %s 已完全停止", mq.consumerName)
-	})
-}
-
 // Start 启动消息队列
 func (mq *MessageQueue) Start(ctx context.Context) error {
 	mq.mu.Lock()
@@ -310,38 +296,87 @@ func (mq *MessageQueue) Start(ctx context.Context) error {
 	mq.wg.Add(1)
 	go mq.processNewMessages(ctx)
 
-	// 启动自动清理goroutine（如果启用）
-	if mq.cleanupPolicy.EnableAutoCleanup {
-		mq.wg.Add(1)
-		go mq.autoCleanupMessages(ctx)
-		log.Printf("已启用自动清理，间隔: %v", mq.cleanupPolicy.CleanupInterval)
-	}
+	// 启动监控重试队列的goroutine
+	mq.wg.Add(1)
+	go mq.monitorRetryQueue(ctx)
 
-	log.Printf("消息队列已启动 - Stream: %s, Group: %s, Consumer: %s",
+	// 启动监控长时间未确认消息的goroutine
+	mq.wg.Add(1)
+	go mq.monitorLongPendingMessages(ctx)
+
+	// 清理有关的
+	mq.cleaner.OnStart(ctx)
+
+	mq.logger.Printf("消息队列已启动 - Stream: %s, Group: %s, Consumer: %s",
 		mq.streamName, mq.groupName, mq.consumerName)
 
 	return nil
 }
 
-// Stop 停止消息队列
-func (mq *MessageQueue) Stop() {
+// stop 内部统一的停止方法
+func (mq *MessageQueue) stop(isAuto bool, reason string) {
 	mq.mu.Lock()
 	if mq.stopped {
 		mq.mu.Unlock()
 		return
 	}
+
+	if isAuto {
+		mq.autoStopped = true
+	}
 	mq.stopped = true
 	mq.mu.Unlock()
 
-	close(mq.stopChan)
-
-	// 如果不是自动停止，则关闭doneChan
-	if !mq.autoStopped {
-		close(mq.doneChan)
+	if isAuto {
+		mq.logger.Printf("消费者 %s 自动停止: %s", mq.consumerName, reason)
 	}
 
+	mq.stopInternal()
+
+	// 简化停止完成日志
+	if isAuto {
+		mq.logger.Printf("消费者 %s 已停止", mq.consumerName)
+	} else {
+		mq.logger.Printf("消息队列已停止")
+	}
+}
+
+// autoStop 自动停止消费者（因为topic被删除）
+func (mq *MessageQueue) autoStop(reason string) {
+	mq.stop(true, reason)
+}
+
+// Stop 停止消息队列
+func (mq *MessageQueue) Stop() {
+	mq.stop(false, "")
+}
+
+// stopInternal 内部停止方法，处理共同的停止逻辑
+func (mq *MessageQueue) stopInternal() {
+	// 关闭停止通道以通知所有goroutine停止
+	close(mq.stopChan)
+
+	// 停止清理器
+	mq.cleaner.Stop()
+
+	// 如果不是自动停止，则关闭doneChan
+	// 如果是自动停止，doneChan已经在autoStop中关闭
+	if !mq.autoStopped {
+		close(mq.doneChan)
+	} else {
+		// 如果是自动停止，确保doneChan被关闭
+		select {
+		case <-mq.doneChan:
+			// 通道已经关闭，不需要操作
+		default:
+			// 通道未关闭，关闭它
+			close(mq.doneChan)
+		}
+	}
+
+	// 等待所有goroutine结束
 	mq.wg.Wait()
-	log.Printf("消息队列已停止")
+	mq.cleaner.Wait()
 }
 
 // createConsumerGroup 创建消费者组
@@ -362,7 +397,7 @@ func (mq *MessageQueue) createConsumerGroup(ctx context.Context) error {
 		startID = "$" // 默认从最新开始
 	}
 
-	log.Printf("创建消费者组 %s，开始位置: %s", mq.groupName, startID)
+	mq.logger.Printf("创建消费者组 %s，开始位置: %s", mq.groupName, startID)
 
 	// 尝试创建消费者组
 	err := mq.client.XGroupCreate(ctx, mq.streamName, mq.groupName, startID).Err()
@@ -392,8 +427,6 @@ func (mq *MessageQueue) createConsumerGroup(ctx context.Context) error {
 func (mq *MessageQueue) processPendingMessages(ctx context.Context) {
 	defer mq.wg.Done()
 
-	log.Printf("开始处理pending消息...")
-
 	for {
 		select {
 		case <-mq.stopChan:
@@ -413,17 +446,15 @@ func (mq *MessageQueue) processPendingMessages(ctx context.Context) {
 			if err != nil {
 				// 检查是否是因为Stream或消费者组被删除
 				if isStreamOrGroupDeletedError(err) {
-					log.Printf("检测到Stream或消费者组已被删除，停止pending消息处理")
-					mq.autoStop("Stream或消费者组被删除")
+					mq.logger.Printf("检测到Stream或消费者组已被删除，停止处理")
+					go mq.autoStop("Stream或消费者组被删除")
 					return
 				}
 
 				time.Sleep(time.Second)
 				continue
 			}
-
 			if len(pending) == 0 {
-				log.Printf("没有pending消息，开始处理新消息")
 				return // 没有pending消息，退出
 			}
 
@@ -452,82 +483,34 @@ func (mq *MessageQueue) processPendingMessage(ctx context.Context, messageID str
 		MinIdle:  0,
 		Messages: []string{messageID},
 	}).Result()
-
 	if err != nil {
-		log.Printf("声明消息所有权失败 %s: %v", messageID, err)
+		// 保留错误日志，这是重要的错误信息
+		mq.logger.Printf("声明消息所有权失败 %s: %v", messageID, err)
 		return
 	}
-
 	if len(claimed) == 0 {
 		return
 	}
-
 	// 处理消息
-	for _, msg := range claimed {
-		mq.handleMessage(ctx, msg)
-	}
+	parsedMessages := mq.parseMessages(ctx, claimed)
+	// 统一调用消息处理方法
+	mq.handleMessages(ctx, parsedMessages)
 }
 
 // processNewMessages 处理新消息
 func (mq *MessageQueue) processNewMessages(ctx context.Context) {
 	defer mq.wg.Done()
+	// 直接处理消息，不再分别调用两个不同的方法
+	mq.processMessages(ctx, mq.GetBatchConfig())
+}
 
-	log.Printf("开始处理新消息...")
-
-	// 检查是否启用批量处理
-	batchConfig := mq.GetBatchConfig()
+func (mq *MessageQueue) processMessages(ctx context.Context, batchConfig *BatchConfig) {
+	batchSize := 1
+	blockTimeout := time.Second * 5
 	if batchConfig.EnableBatch {
-		mq.processNewMessagesBatch(ctx)
-	} else {
-		mq.processNewMessagesSingle(ctx)
+		batchSize = batchConfig.BatchSize
+		blockTimeout = batchConfig.BatchTimeout
 	}
-}
-
-// processNewMessagesSingle 单条消息处理模式
-func (mq *MessageQueue) processNewMessagesSingle(ctx context.Context) {
-	for {
-		select {
-		case <-mq.stopChan:
-			return
-		case <-ctx.Done():
-			return
-		default:
-			// 读取新消息
-			streams, err := mq.client.XReadGroup(ctx, &redis.XReadGroupArgs{
-				Group:    mq.groupName,
-				Consumer: mq.consumerName,
-				Streams:  []string{mq.streamName, ">"},
-				Count:    1,
-				Block:    time.Second * 5,
-			}).Result()
-
-			if err != nil {
-				if !errors.Is(err, redis.Nil) {
-					log.Printf("读取新消息失败: %v", err)
-
-					// 检查是否是因为Stream或消费者组被删除
-					if isStreamOrGroupDeletedError(err) {
-						log.Printf("检测到Stream或消费者组已被删除，停止消费者")
-						mq.autoStop("Stream或消费者组被删除")
-						return
-					}
-				}
-				continue
-			}
-
-			// 处理消息
-			for _, stream := range streams {
-				for _, msg := range stream.Messages {
-					mq.handleMessage(ctx, msg)
-				}
-			}
-		}
-	}
-}
-
-// processNewMessagesBatch 批量消息处理模式
-func (mq *MessageQueue) processNewMessagesBatch(ctx context.Context) {
-	batchConfig := mq.GetBatchConfig()
 
 	for {
 		select {
@@ -536,165 +519,98 @@ func (mq *MessageQueue) processNewMessagesBatch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			// 读取批量消息
+			// 读取消息
 			streams, err := mq.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 				Group:    mq.groupName,
 				Consumer: mq.consumerName,
 				Streams:  []string{mq.streamName, ">"},
-				Count:    int64(batchConfig.BatchSize),
-				Block:    batchConfig.BatchTimeout,
+				Count:    int64(batchSize),
+				Block:    blockTimeout,
 			}).Result()
-
 			if err != nil {
 				if !errors.Is(err, redis.Nil) {
-					log.Printf("读取批量消息失败: %v", err)
-
+					mq.logger.Printf("读取消息失败: %v", err)
 					// 检查是否是因为Stream或消费者组被删除
 					if isStreamOrGroupDeletedError(err) {
-						log.Printf("检测到Stream或消费者组已被删除，停止消费者")
-						mq.autoStop("Stream或消费者组被删除")
+						mq.logger.Printf("检测到Stream或消费者组已被删除，停止消费者")
+						go mq.autoStop("Stream或消费者组被删除")
 						return
 					}
 				}
 				continue
 			}
-
-			// 处理批量消息
 			for _, stream := range streams {
-				if len(stream.Messages) > 0 {
-					mq.handleMessagesBatch(ctx, stream.Messages)
+				if len(stream.Messages) == 0 {
+					continue
 				}
+				parsedMessages := mq.parseMessages(ctx, stream.Messages)
+				mq.handleMessages(ctx, parsedMessages)
 			}
 		}
 	}
 }
 
-// handleMessage 处理消息
-func (mq *MessageQueue) handleMessage(ctx context.Context, msg redis.XMessage) {
-	// 解析消息
-	message, err := mq.parseMessage(msg)
-	if err != nil {
-		log.Printf("解析消息失败 %s: %v", msg.ID, err)
-		mq.ackMessage(ctx, msg.ID)
+// handleMessages 处理消息，支持单条和批量处理
+func (mq *MessageQueue) handleMessages(ctx context.Context, messages []*Message) {
+	if len(messages) == 0 {
 		return
 	}
-
-	// 获取处理器
-	mq.mu.RLock()
-	handler, exists := mq.handlers[message.Type]
-	mq.mu.RUnlock()
-
-	if !exists {
-		log.Printf("未找到消息类型 %s 的处理器", message.Type)
-		mq.ackMessage(ctx, msg.ID)
-		return
-	}
-
-	// 处理消息
-	log.Printf("处理消息: %s, 类型: %s", msg.ID, message.Type)
-	err = handler.Handle(ctx, message)
-	if err != nil {
-		log.Printf("处理消息失败 %s: %v", msg.ID, err)
-		// 这里可以实现重试逻辑或者死信队列
-		return
-	}
-
-	// ACK消息
-	mq.ackMessage(ctx, msg.ID)
-	log.Printf("消息处理完成: %s", msg.ID)
-}
-
-// handleMessagesBatch 批量处理消息
-func (mq *MessageQueue) handleMessagesBatch(ctx context.Context, msgs []redis.XMessage) {
-	if len(msgs) == 0 {
-		return
-	}
-
-	// 按消息类型分组
-	messageGroups := make(map[string][]*Message)
-	messageIDGroups := make(map[string][]string)
-
-	for _, msg := range msgs {
-		// 解析消息
-		message, err := mq.parseMessage(msg)
-		if err != nil {
-			log.Printf("解析消息失败 %s: %v", msg.ID, err)
-			mq.ackMessage(ctx, msg.ID)
-			continue
-		}
-
-		// 按类型分组
-		messageGroups[message.Type] = append(messageGroups[message.Type], message)
-		messageIDGroups[message.Type] = append(messageIDGroups[message.Type], msg.ID)
-	}
-
-	// 处理每个类型的消息组
-	for msgType, messages := range messageGroups {
-		messageIDs := messageIDGroups[msgType]
-
-		// 获取批量处理器
-		mq.mu.RLock()
-		batchHandler, hasBatchHandler := mq.batchHandlers[msgType]
-		singleHandler, hasSingleHandler := mq.handlers[msgType]
-		mq.mu.RUnlock()
-
-		if hasBatchHandler {
-			// 使用批量处理器
-			batchSize := batchHandler.GetBatchSize()
+	messageGroups := lo.GroupBy(messages, func(item *Message) string {
+		return item.Type
+	})
+	for msgType, typedMessages := range messageGroups {
+		single, batch := mq.getHandlerByType(msgType)
+		switch {
+		case batch != nil:
+			batchSize := (*batch).GetBatchSize()
 			if batchSize <= 0 {
 				batchSize = mq.GetBatchConfig().BatchSize
 			}
-
-			// 如果消息数量超过批量大小，分批处理
-			for i := 0; i < len(messages); i += batchSize {
-				end := i + batchSize
-				if end > len(messages) {
-					end = len(messages)
-				}
-
-				batch := messages[i:end]
-				batchIDs := messageIDs[i:end]
-
-				log.Printf("批量处理消息: 类型=%s, 数量=%d", msgType, len(batch))
-				err := batchHandler.HandleBatch(ctx, batch)
+			for i := 0; i < len(typedMessages); i += batchSize {
+				end := min(i+batchSize, len(typedMessages))
+				batchMsg := typedMessages[i:end]
+				err := (*batch).HandleBatch(ctx, batchMsg)
 				if err != nil {
-					log.Printf("批量处理消息失败 类型=%s: %v", msgType, err)
-					// 这里可以实现重试逻辑或者死信队列
+					mq.logger.Printf("批量处理消息失败 类型=%s: %v", msgType, err)
+					// 为每条消息安排重试
+					for _, msg := range batchMsg {
+						mq.handleMessageFailure(ctx, msg, err)
+					}
 					continue
 				}
-
-				// 批量ACK消息
-				for _, messageID := range batchIDs {
-					mq.ackMessage(ctx, messageID)
-				}
-				log.Printf("批量消息处理完成: 类型=%s, 数量=%d", msgType, len(batch))
+				mq.ackMessages(ctx, extractIds(batchMsg))
 			}
-		} else if hasSingleHandler {
+		case single != nil:
 			// 回退到单条处理
-			log.Printf("未找到批量处理器，回退到单条处理: 类型=%s, 数量=%d", msgType, len(messages))
-			for i, message := range messages {
-				messageID := messageIDs[i]
-
-				log.Printf("处理消息: %s, 类型: %s", messageID, msgType)
-				err := singleHandler.Handle(ctx, message)
+			mq.logger.Printf("未找到批量处理器，回退到单条处理: 类型=%s, 数量=%d", msgType, len(typedMessages))
+			for _, message := range typedMessages {
+				err := (*single).Handle(ctx, message)
 				if err != nil {
-					log.Printf("处理消息失败 %s: %v", messageID, err)
-					// 这里可以实现重试逻辑或者死信队列
+					// 使用新的错误处理逻辑
+					mq.handleMessageFailure(ctx, message, err)
 					continue
 				}
-
-				// ACK消息
-				mq.ackMessage(ctx, messageID)
-				log.Printf("消息处理完成: %s", messageID)
+				mq.ackMessage(ctx, message.ID)
 			}
-		} else {
-			// 没有找到处理器
-			log.Printf("未找到消息类型 %s 的处理器", msgType)
-			for _, messageID := range messageIDs {
-				mq.ackMessage(ctx, messageID)
-			}
+		default:
+			mq.logger.Printf("no handler found for message type: %s", msgType)
+			mq.ackMessages(ctx, extractIds(typedMessages))
 		}
 	}
+}
+
+func (mq *MessageQueue) getHandlerByType(messageType string) (singleHandler *MessageHandler, batchHandler *BatchMessageHandler) {
+	mq.mu.RLock()
+	singleHandler_, exists := mq.handlers[messageType]
+	if exists {
+		singleHandler = &singleHandler_
+	}
+	batchHandler_, exists := mq.batchHandlers[messageType]
+	if exists {
+		batchHandler = &batchHandler_
+	}
+	mq.mu.RUnlock()
+	return singleHandler, batchHandler
 }
 
 // parseMessage 解析消息
@@ -729,50 +645,52 @@ func (mq *MessageQueue) parseMessage(msg redis.XMessage) (*Message, error) {
 	return message, nil
 }
 
+// parseMessages 批量解析消息并处理错误
+func (mq *MessageQueue) parseMessages(ctx context.Context, redisMessages []redis.XMessage) []*Message {
+	parsedMessages := make([]*Message, 0, len(redisMessages))
+	for _, redisMsg := range redisMessages {
+		// 解析消息
+		message, err := mq.parseMessage(redisMsg)
+		if err != nil {
+			mq.logger.Printf("解析消息失败 %s: %v", redisMsg.ID, err)
+			mq.ackMessage(ctx, redisMsg.ID)
+			continue
+		}
+		parsedMessages = append(parsedMessages, message)
+	}
+	return parsedMessages
+}
+
 // ackMessage ACK消息
 func (mq *MessageQueue) ackMessage(ctx context.Context, messageID string) {
 	err := mq.client.XAck(ctx, mq.streamName, mq.groupName, messageID).Err()
 	if err != nil {
-		log.Printf("ACK消息失败 %s: %v", messageID, err)
-
+		// 保留ACK失败的错误日志，这是重要的错误信息
+		mq.logger.Printf("ACK消息失败 %s: %v", messageID, err)
 		// 检查是否是因为Stream或消费者组被删除
 		if isStreamOrGroupDeletedError(err) {
-			log.Printf("检测到Stream或消费者组已被删除，ACK操作失败")
-			mq.autoStop("Stream或消费者组被删除")
+			mq.logger.Printf("检测到Stream或消费者组已被删除，ACK操作失败")
+			go mq.autoStop("Stream或消费者组被删除")
+		} else {
+			// TODO: 添加一些重试机制
 		}
 	}
 }
 
-// isStreamOrGroupDeletedError 检查错误是否是因为Stream或消费者组被删除
-func isStreamOrGroupDeletedError(err error) bool {
-	if err == nil {
-		return false
+func (mq *MessageQueue) ackMessages(ctx context.Context, messageIDs []string) {
+	for _, messageID := range messageIDs {
+		mq.ackMessage(ctx, messageID)
 	}
+}
 
-	errStr := err.Error()
-
-	// NOGROUP No such key 'error-demo-test' or consumer group 'error-group-test' in XREADGROUP with GROUP option
-	// 常见的错误模式
-	patterns := []string{
-		"ERR no such key",
-		"NOGROUP",
-		"No such key",
-		"consumer group",
-		"does not exist",
-	}
-
-	for _, pattern := range patterns {
-		if strings.Contains(errStr, pattern) {
-			return true
-		}
-	}
-
-	return false
+// GetTopicInfo 获取topic信息（消息数量、消费者组等）
+func (mq *MessageQueue) GetTopicInfo(ctx context.Context) (*TopicInfo, error) {
+	return getTopicInfo(ctx, mq.client, mq.streamName)
 }
 
 // TerminateTopic 终止整个topic，清空所有消息和消费者组
 func (mq *MessageQueue) TerminateTopic(ctx context.Context) error {
-	log.Printf("开始终止topic: %s", mq.streamName)
+	mq.logger.Printf("终止topic: %s", mq.streamName)
 
 	// 首先停止当前消息队列的处理
 	mq.Stop()
@@ -780,15 +698,13 @@ func (mq *MessageQueue) TerminateTopic(ctx context.Context) error {
 	// 获取所有消费者组信息
 	groups, err := mq.client.XInfoGroups(ctx, mq.streamName).Result()
 	if err != nil && err.Error() != "ERR no such key" {
-		log.Printf("获取消费者组信息失败: %v", err)
+		mq.logger.Printf("获取消费者组信息失败: %v", err)
 	} else {
 		// 删除所有消费者组
 		for _, group := range groups {
 			err = mq.client.XGroupDestroy(ctx, mq.streamName, group.Name).Err()
 			if err != nil {
-				log.Printf("删除消费者组 %s 失败: %v", group.Name, err)
-			} else {
-				log.Printf("已删除消费者组: %s", group.Name)
+				mq.logger.Printf("删除消费者组 %s 失败: %v", group.Name, err)
 			}
 		}
 	}
@@ -799,17 +715,355 @@ func (mq *MessageQueue) TerminateTopic(ctx context.Context) error {
 		return fmt.Errorf("删除Stream失败: %w", err)
 	}
 
+	// 简化Stream删除日志
 	if deleted > 0 {
-		log.Printf("已删除Stream: %s，清空了所有消息", mq.streamName)
-	} else {
-		log.Printf("Stream %s 不存在或已为空", mq.streamName)
+		mq.logger.Printf("已删除Stream: %s", mq.streamName)
 	}
 
-	log.Printf("Topic %s 已完全终止", mq.streamName)
 	return nil
 }
 
-// GetTopicInfo 获取topic信息（消息数量、消费者组等）
-func (mq *MessageQueue) GetTopicInfo(ctx context.Context) (*TopicInfo, error) {
-	return getTopicInfo(ctx, mq.client, mq.streamName)
+// getRetryQueueName 获取重试队列名称
+// 重试队列使用Redis的SortedSet实现，分数为处理时间戳
+func (mq *MessageQueue) getRetryQueueName() string {
+	return mq.streamName + ".retry"
+}
+
+// getDeadLetterQueueName 获取死信队列名称
+// 死信队列使用Redis的Stream实现，存储重试次数超过上限的消息
+func (mq *MessageQueue) getDeadLetterQueueName() string {
+	return mq.streamName + ".dlq"
+}
+
+// monitorLongPendingMessages 监控长时间未确认的消息
+// 这个方法会定期检查消费者组中长时间未被确认的消息，并将它们放入重试队列
+// 在测试模式下，超时时间为3秒，正常模式下为5分钟
+func (mq *MessageQueue) monitorLongPendingMessages(ctx context.Context) {
+	defer mq.wg.Done()
+
+	// 定义超时时间
+	pendingTimeout := time.Minute * 5
+	// 测试模式下使用更短的超时时间
+	if os.Getenv("TEST_MODE") == "1" {
+		pendingTimeout = time.Second * 3
+	}
+
+	// 定时检查
+	ticker := time.NewTicker(time.Minute) // 每分钟检查一次
+	if os.Getenv("TEST_MODE") == "1" {
+		ticker = time.NewTicker(time.Second) // 测试模式下每秒检查一次
+	}
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mq.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 查找超时的pending消息
+			longPendingMessages, err := mq.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+				Stream: mq.streamName,
+				Group:  mq.groupName,
+				Start:  "-",
+				End:    "+",
+				Count:  100,            // 一次最多处理100条
+				Idle:   pendingTimeout, // 只返回空闲超过指定时间的消息
+			}).Result()
+
+			if err != nil {
+				if isStreamOrGroupDeletedError(err) {
+					mq.logger.Printf("检测到Stream或消费者组已被删除，停止监控")
+					go mq.autoStop("Stream或消费者组被删除")
+					return
+				}
+				mq.logger.Printf("获取长时间pending消息失败: %v", err)
+				continue
+			}
+
+			if len(longPendingMessages) == 0 {
+				continue // 没有超时消息，继续等待
+			}
+
+			mq.logger.Printf("发现 %d 条超过 %v 未确认的消息，准备重新处理",
+				len(longPendingMessages), pendingTimeout)
+
+			// 处理每条超时消息
+			for _, p := range longPendingMessages {
+				select {
+				case <-mq.stopChan:
+					return
+				case <-ctx.Done():
+					return
+				default:
+					// 声明消息所有权
+					claimed, err := mq.client.XClaim(ctx, &redis.XClaimArgs{
+						Stream:   mq.streamName,
+						Group:    mq.groupName,
+						Consumer: mq.consumerName,
+						MinIdle:  pendingTimeout,
+						Messages: []string{p.ID},
+					}).Result()
+
+					if err != nil {
+						mq.logger.Printf("声明超时消息所有权失败 %s: %v", p.ID, err)
+						continue
+					}
+
+					if len(claimed) == 0 {
+						continue
+					}
+
+					// 处理每条声明的消息
+					for _, msg := range claimed {
+						message, err := mq.parseMessage(msg)
+						if err != nil {
+							mq.logger.Printf("解析超时消息失败 %s: %v", msg.ID, err)
+							mq.ackMessage(ctx, msg.ID) // 确认错误消息，避免重复处理
+							continue
+						}
+
+						// 确保Metadata已初始化
+						if message.Metadata == nil {
+							message.Metadata = make(map[string]string)
+						}
+
+						// 获取重试次数
+						retryCount := 0
+						if retryCountStr, ok := message.Metadata["retry_count"]; ok {
+							retryCount, _ = strconv.Atoi(retryCountStr)
+						}
+
+						// 判断是否超过最大重试次数
+						maxRetries := 3 // 默认最大重试次数
+						if mq.maxRetries > 0 {
+							maxRetries = mq.maxRetries
+						}
+
+						if retryCount >= maxRetries {
+							// 发送到死信队列
+							mq.logger.Printf("消息 %s 已超过最大重试次数 %d，发送到死信队列",
+								message.ID, maxRetries)
+							mq.sendToDeadLetterQueue(ctx, message)
+							mq.ackMessage(ctx, message.ID) // 确认原消息
+						} else {
+							// 更新重试信息
+							message.Metadata["retry_count"] = strconv.Itoa(retryCount + 1)
+							message.Metadata["last_retry_time"] = time.Now().Format(time.RFC3339)
+
+							// 计算延迟时间（指数退避）
+							var delaySeconds int
+							if os.Getenv("TEST_MODE") == "1" {
+								// 测试模式下使用更短的延迟 (1秒的指数退避)
+								delaySeconds = int(math.Pow(2, float64(retryCount)))
+								mq.logger.Printf("测试模式：设置延迟时间为 %d 秒", delaySeconds)
+							} else {
+								delaySeconds = int(math.Pow(2, float64(retryCount))) * 60 // 1分钟的指数退避
+							}
+							mq.scheduleRetry(ctx, message, delaySeconds)
+							mq.ackMessage(ctx, message.ID) // 确认原消息
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// handleMessageFailure 处理消息失败时的重试逻辑
+// 当消息处理失败时，该方法会根据重试次数决定是放入重试队列还是死信队列
+// 重试策略采用指数退避，在测试模式下为1秒的指数退避，正常模式下为1分钟的指数退避
+func (mq *MessageQueue) handleMessageFailure(ctx context.Context, message *Message, err error) {
+	mq.logger.Printf("处理消息失败 %s: %v", message.ID, err)
+
+	// 获取重试次数
+	retryCount := 0
+	if retryCountStr, ok := message.Metadata["retry_count"]; ok {
+		retryCount, _ = strconv.Atoi(retryCountStr)
+	}
+
+	// 更新重试信息
+	message.Metadata["retry_count"] = strconv.Itoa(retryCount + 1)
+	message.Metadata["last_error"] = err.Error()
+	message.Metadata["last_retry_time"] = time.Now().Format(time.RFC3339)
+
+	// 判断是否超过最大重试次数
+	maxRetries := 3 // 默认最大重试次数
+	if mq.maxRetries > 0 {
+		maxRetries = mq.maxRetries
+	}
+
+	if retryCount >= maxRetries {
+		// 发送到死信队列
+		mq.sendToDeadLetterQueue(ctx, message)
+	} else {
+		// 计算延迟时间（指数退避）
+		var delaySeconds int
+		if os.Getenv("TEST_MODE") == "1" {
+			// 测试模式下使用更短的延迟 (1秒的指数退避)
+			delaySeconds = int(math.Pow(2, float64(retryCount)))
+			mq.logger.Printf("测试模式：设置延迟时间为 %d 秒", delaySeconds)
+		} else {
+			delaySeconds = int(math.Pow(2, float64(retryCount))) * 60 // 1分钟的指数退避
+		}
+		mq.scheduleRetry(ctx, message, delaySeconds)
+	}
+
+	// 确认当前消息
+	mq.ackMessage(ctx, message.ID)
+}
+
+// sendToDeadLetterQueue 发送消息到死信队列
+// 当消息重试次数超过最大限制时，会被发送到死信队列
+// 死信队列中的消息保留原始消息的所有信息，并添加失败相关的元数据
+func (mq *MessageQueue) sendToDeadLetterQueue(ctx context.Context, message *Message) error {
+	dlqName := mq.getDeadLetterQueueName()
+
+	// 添加额外的元数据
+	message.Metadata["original_id"] = message.ID
+	message.Metadata["failure_time"] = time.Now().Format(time.RFC3339)
+
+	// 序列化消息数据和元数据
+	dataJson, err := json.Marshal(message.Data)
+	if err != nil {
+		return err
+	}
+
+	metadataJson, err := json.Marshal(message.Metadata)
+	if err != nil {
+		return err
+	}
+
+	// 将消息添加到死信队列Stream
+	_, err = mq.client.XAdd(ctx, &redis.XAddArgs{
+		Stream: dlqName,
+		Values: map[string]interface{}{
+			"type":     message.Type,
+			"data":     string(dataJson),
+			"metadata": string(metadataJson),
+		},
+	}).Result()
+
+	if err != nil {
+		mq.logger.Printf("发送消息到死信队列失败: %v", err)
+		return err
+	}
+
+	mq.logger.Printf("消息 %s 已发送到死信队列 %s", message.ID, dlqName)
+	return nil
+}
+
+// scheduleRetry 安排消息重试
+// 将消息序列化后放入Redis的SortedSet中，分数为计划处理时间
+// 重试延迟时间根据重试次数递增，采用指数退避算法
+func (mq *MessageQueue) scheduleRetry(ctx context.Context, message *Message, delaySeconds int) error {
+	retryQueueName := mq.getRetryQueueName()
+
+	// 序列化整个消息
+	messageBytes, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+
+	// 计算执行时间（当前时间 + 延迟时间）
+	processTime := time.Now().Add(time.Second * time.Duration(delaySeconds)).Unix()
+
+	// 添加到Sorted Set，分数为处理时间
+	err = mq.client.ZAdd(ctx, retryQueueName, redis.Z{
+		Score:  float64(processTime),
+		Member: string(messageBytes),
+	}).Err()
+
+	if err != nil {
+		mq.logger.Printf("安排消息重试失败: %v", err)
+		return err
+	}
+
+	mq.logger.Printf("消息 %s 已安排在 %d 秒后重试", message.ID, delaySeconds)
+	return nil
+}
+
+// monitorRetryQueue 监控重试队列
+// 这个方法会定期检查重试队列中是否有到期需要处理的消息
+// 到期的消息会被重新放回原始Stream中进行处理
+func (mq *MessageQueue) monitorRetryQueue(ctx context.Context) {
+	defer mq.wg.Done()
+
+	retryQueueName := mq.getRetryQueueName()
+	pollInterval := time.Second * 5 // 每5秒检查一次
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-mq.stopChan:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 获取当前时间作为分数上限
+			now := time.Now().Unix()
+
+			// 查找所有应该处理的消息（分数 <= 当前时间）
+			messages, err := mq.client.ZRangeByScore(ctx, retryQueueName, &redis.ZRangeBy{
+				Min:    "0",
+				Max:    fmt.Sprintf("%d", now),
+				Offset: 0,
+				Count:  10, // 一次处理10条
+			}).Result()
+
+			if err != nil {
+				mq.logger.Printf("获取重试队列消息失败: %v", err)
+				continue
+			}
+
+			if len(messages) == 0 {
+				continue // 没有需要重试的消息
+			}
+
+			// 处理每条需要重试的消息
+			for _, msgStr := range messages {
+				// 反序列化消息
+				var message Message
+				if err := json.Unmarshal([]byte(msgStr), &message); err != nil {
+					mq.logger.Printf("解析重试消息失败: %v", err)
+					// 从重试队列中删除这条错误消息
+					mq.client.ZRem(ctx, retryQueueName, msgStr)
+					continue
+				}
+
+				// 将消息重新添加到原队列
+				dataJson, _ := json.Marshal(message.Data)
+				metadataJson, _ := json.Marshal(message.Metadata)
+
+				// 保存原始ID
+				oldID := message.ID
+				if oldID != "" && message.Metadata["original_id"] == "" {
+					message.Metadata["original_id"] = oldID
+				}
+
+				// 重新发送到原始队列
+				newID, err := mq.client.XAdd(ctx, &redis.XAddArgs{
+					Stream: mq.streamName,
+					Values: map[string]interface{}{
+						"type":     message.Type,
+						"data":     string(dataJson),
+						"metadata": string(metadataJson),
+					},
+				}).Result()
+
+				if err != nil {
+					mq.logger.Printf("重新入队失败: %v", err)
+					continue
+				}
+
+				mq.logger.Printf("消息已重新入队，原ID: %s, 新ID: %s", oldID, newID)
+
+				// 从重试队列中删除已处理的消息
+				mq.client.ZRem(ctx, retryQueueName, msgStr)
+			}
+		}
+	}
 }

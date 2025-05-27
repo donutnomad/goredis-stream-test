@@ -7,18 +7,12 @@ import (
 	"time"
 
 	"goStream/queue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // TestBatchProcessing 测试批量处理功能
 func TestBatchProcessing(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()
@@ -141,11 +135,7 @@ func TestBatchProcessing(t *testing.T) {
 // TestMixedProcessing 测试混合处理（批量+单条）
 func TestMixedProcessing(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()

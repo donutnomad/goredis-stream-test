@@ -14,11 +14,7 @@ import (
 // TestErrorHandlingWhenTopicDeleted 测试topic删除时的错误处理
 func TestErrorHandlingWhenTopicDeleted(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	// 测试Redis连接
 	ctx := context.Background()
@@ -171,9 +167,7 @@ func monitorConsumerErrors(t *testing.T, ctx context.Context, consumer *queue.Me
 	t.Log("👀 开始监控消费者错误...")
 
 	// 创建一个新的Redis客户端来监控
-	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	rdb := getRDB()
 
 	ticker := time.NewTicker(time.Second * 2)
 	defer ticker.Stop()
@@ -271,11 +265,7 @@ func checkRedisErrors(t *testing.T, rdb *redis.Client, streamName, groupName str
 // TestSpecificErrorTypes 测试特定的错误类型
 func TestSpecificErrorTypes(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()

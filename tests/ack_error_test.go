@@ -6,18 +6,12 @@ import (
 	"time"
 
 	"goStream/queue"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // TestACKErrorWhenTopicDeleted 专门测试ACK错误
 func TestACKErrorWhenTopicDeleted(t *testing.T) {
 	// 创建Redis客户端
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	rdb := getRDB()
 
 	ctx := context.Background()
 	_, err := rdb.Ping(ctx).Result()

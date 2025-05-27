@@ -3,12 +3,19 @@ package queue
 import (
 	"context"
 	"fmt"
+	"iter"
 	"log"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/samber/lo"
 )
+
+const SMALL_POS = "-" // 初始从最小ID开始
+const BIG_POS = "+"
 
 // CleanupStats 清理统计信息
 type CleanupStats struct {
@@ -25,8 +32,19 @@ type MessageCleaner struct {
 	stopChan      chan struct{}
 }
 
+func NewMessageCleaner(client *redis.Client, streamName, consumerName string) *MessageCleaner {
+	return &MessageCleaner{
+		client:        client,
+		streamName:    streamName,
+		consumerName:  consumerName,
+		cleanupPolicy: DefaultCleanupPolicy(),
+		wg:            sync.WaitGroup{},
+		stopChan:      make(chan struct{}),
+	}
+}
+
 // CoordinatedCleanup 协调的清理操作
-func (mq *MessageCleaner) CoordinatedCleanup(ctx context.Context) (int, error) {
+func (mq *MessageCleaner) CoordinatedCleanup(ctx context.Context) (int64, error) {
 	coordinator := NewCleanupCoordinator(mq.client, mq.streamName)
 
 	// 尝试获取清理锁
@@ -65,90 +83,41 @@ func (mq *MessageCleaner) CoordinatedCleanup(ctx context.Context) (int, error) {
 	return cleaned, nil
 }
 
-// SetCleanupPolicy 设置清理策略
 func (mq *MessageCleaner) SetCleanupPolicy(policy *CleanupPolicy) {
 	mq.cleanupPolicy = policy
 }
 
-// GetCleanupPolicy 获取清理策略
-func (mq *MessageQueue) GetCleanupPolicy() *CleanupPolicy {
+func (mq *MessageCleaner) GetCleanupPolicy() *CleanupPolicy {
 	return mq.cleanupPolicy
 }
 
 // CleanupMessages 手动清理消息
-func (mq *MessageCleaner) CleanupMessages(ctx context.Context) (int, error) {
+func (mq *MessageCleaner) CleanupMessages(ctx context.Context) (totalDeleted int64, _ error) {
 	policy := mq.cleanupPolicy
-
 	log.Printf("开始手动清理Stream %s", mq.streamName)
-
-	// 查找可以清理的消息
-	cleanableMessages, err := mq.findCleanableMessages(ctx, policy)
-	if err != nil {
-		return 0, fmt.Errorf("查找可清理消息失败: %w", err)
-	}
-
-	if len(cleanableMessages) == 0 {
-		log.Printf("没有找到可清理的消息")
-		return 0, nil
-	}
-
-	// 执行清理
-	cleaned, err := mq.cleanMessages(ctx, cleanableMessages, policy.BatchSize)
-	if err != nil {
-		return 0, fmt.Errorf("清理消息失败: %w", err)
-	}
-
-	log.Printf("手动清理完成，清理了 %d 条消息", cleaned)
-	return cleaned, nil
-}
-
-// cleanMessages 清理指定的消息
-func (mq *MessageCleaner) cleanMessages(ctx context.Context, messageIDs []string, batchSize int64) (int, error) {
-	if len(messageIDs) == 0 {
-		return 0, nil
-	}
-
-	cleaned := 0
-	batchCount := int(batchSize)
-
-	for i := 0; i < len(messageIDs); i += batchCount {
-		end := i + batchCount
-		if end > len(messageIDs) {
-			end = len(messageIDs)
-		}
-
-		batch := messageIDs[i:end]
-
-		// 使用XDEL删除消息
-		deleted, err := mq.client.XDel(ctx, mq.streamName, batch...).Result()
+	for msgIds, err := range mq.findCleanableMessages(ctx, policy, int64(200)) {
 		if err != nil {
-			return cleaned, fmt.Errorf("删除消息批次失败: %w", err)
+			return 0, err
 		}
-
-		cleaned += int(deleted)
-		log.Printf("删除了 %d 条消息，批次: %d-%d", deleted, i+1, end)
-
-		// 避免一次性删除太多消息影响性能
-		if i+batchCount < len(messageIDs) {
-			time.Sleep(time.Millisecond * 100)
+		deleted, err := mq.client.XDel(ctx, mq.streamName, msgIds...).Result()
+		if err != nil {
+			log.Printf("删除消息批次失败: %v", err)
+			continue
 		}
+		totalDeleted += deleted
 	}
-
-	return cleaned, nil
+	log.Printf("手动清理完成，清理了 %d 条消息", totalDeleted)
+	return totalDeleted, nil
 }
 
-// findCleanableMessages 查找可以清理的消息
-func (mq *MessageCleaner) findCleanableMessages(ctx context.Context, policy *CleanupPolicy) ([]string, error) {
-	// 获取所有消费者组
+func (mq *MessageCleaner) getMinDeliveredIDForAllGroup(ctx context.Context) ([]string, *string, error) {
 	groups, err := mq.client.XInfoGroups(ctx, mq.streamName).Result()
 	if err != nil {
-		return nil, fmt.Errorf("获取消费者组失败: %w", err)
+		return nil, nil, fmt.Errorf("[cleaner] call XInfoGroups failed: %w", err)
 	}
 	if len(groups) == 0 {
-		log.Printf("没有消费者组，无法确定可清理的消息")
-		return nil, nil
+		return nil, nil, nil
 	}
-	// 获取所有消费者组的最小已确认消息ID
 	minDeliveredID := ""
 	for i, group := range groups {
 		if i == 0 || compareMessageIDs(group.LastDeliveredID, minDeliveredID) < 0 {
@@ -156,60 +125,139 @@ func (mq *MessageCleaner) findCleanableMessages(ctx context.Context, policy *Cle
 		}
 	}
 	if minDeliveredID == "" || minDeliveredID == "0-0" {
-		log.Printf("没有找到有效的最小已确认消息ID")
-		return nil, nil
+		return nil, nil, nil
 	}
-	// 获取可以清理的消息（在最小已确认ID之前的消息）
-	cleanableMessages := make([]string, 0)
-	// 使用XRANGE获取从开始到最小已确认ID之前的消息
-	messages, err := mq.client.XRange(ctx, mq.streamName, "-", minDeliveredID).Result()
-	if err != nil {
-		return nil, fmt.Errorf("获取消息范围失败: %w", err)
+	return lo.Map(groups, func(item redis.XInfoGroup, index int) string {
+		return item.Name
+	}), &minDeliveredID, nil
+}
+
+func (mq *MessageCleaner) findCleanableMessages(ctx context.Context, policy *CleanupPolicy, batchSize int64) iter.Seq2[[]string, error] {
+	var startID = SMALL_POS
+	return func(yield func([]string, error) bool) {
+		groupNames, minDeliveredID, err := mq.getMinDeliveredIDForAllGroup(ctx)
+		if err != nil || minDeliveredID == nil {
+			yield(nil, err)
+			return
+		}
+		for {
+			messages, err := mq.client.XRangeN(ctx, mq.streamName, startID, *minDeliveredID, batchSize).Result()
+			if err != nil {
+				yield(nil, fmt.Errorf("[cleaner] XRangeN failed: %w", err))
+				return
+			}
+			if len(messages) == 0 {
+				break
+			}
+			startID = excludeID(messages[len(messages)-1].ID)
+			candidateMessages := lo.Filter(messages, func(msg redis.XMessage, index int) bool {
+				return isMessageOldEnough(msg.ID, policy.MinRetentionTime)
+			})
+			candidateIDs := lo.Map(candidateMessages, func(msg redis.XMessage, _ int) string {
+				return msg.ID
+			})
+			ids := slices.Collect(mq.areMessagesFullyAcked(ctx, candidateIDs, groupNames))
+			if !yield(ids, nil) {
+				return
+			}
+			if int64(len(messages)) < batchSize {
+				break
+			}
+		}
+
 	}
-	// 检查每个消息是否被所有消费者组确认
-	for _, msg := range messages {
-		if mq.isMessageFullyAcked(ctx, msg.ID, groups) {
-			// 检查消息年龄
-			if isMessageOldEnough(msg.ID, policy.MinRetentionTime) {
-				cleanableMessages = append(cleanableMessages, msg.ID)
+}
+
+// areMessagesFullyAcked 批量检查多个消息是否被所有消费者组确认
+func (mq *MessageCleaner) areMessagesFullyAcked(ctx context.Context, messageIDs []string, groupNames []string) iter.Seq[string] {
+	if len(messageIDs) == 0 {
+		return func(yield func(string) bool) {}
+	}
+	ackIds := make(map[string]bool)
+	for _, id := range messageIDs {
+		ackIds[id] = true // 默认为已确认
+	}
+	for _, groupName := range groupNames {
+		// 先检查该消费者组是否有pending消息
+		pendingSummary, err := mq.client.XPending(ctx, mq.streamName, groupName).Result()
+		if err != nil {
+			log.Printf("获取消费者组pending摘要失败 %s: %v", groupName, err)
+			// 出错时保守处理，假设所有消息未确认
+			for id := range ackIds {
+				ackIds[id] = false
+			}
+			continue
+		}
+		// 如果该组没有pending消息，直接跳过检查
+		if pendingSummary.Count == 0 {
+			log.Printf("消费者组 %s 没有pending消息，跳过检查", groupName)
+			continue
+		}
+
+		// 对消息ID进行排序，确保顺序查询
+		sortedIDs := make([]string, len(messageIDs))
+		copy(sortedIDs, messageIDs)
+		sort.Strings(sortedIDs)
+
+		for start := 0; start < len(sortedIDs); start += 100 {
+			end := min(start+100, len(sortedIDs))
+			if len(sortedIDs[start:end]) == 0 {
+				continue
+			}
+			startID := sortedIDs[start]
+			endID := sortedIDs[end-1]
+			pendingMessages, err := mq.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+				Stream: mq.streamName,
+				Group:  groupName,
+				Start:  startID,
+				End:    endID,
+				Count:  int64(end - start),
+			}).Result()
+			if err != nil {
+				log.Printf("批量检查pending消息失败 %s-%s: %v", startID, endID, err)
+				// 出错时保守处理，将所有消息标记为未确认
+				for i := start; i < end; i++ {
+					ackIds[sortedIDs[i]] = false
+				}
+				continue
+			}
+			// 将找到的pending消息标记为未确认
+			for _, pending := range pendingMessages {
+				ackIds[pending.ID] = false
 			}
 		}
 	}
-	return cleanableMessages, nil
-}
 
-// isMessageFullyAcked 检查消息是否被所有消费者组确认
-func (mq *MessageCleaner) isMessageFullyAcked(ctx context.Context, messageID string, groups []redis.XInfoGroup) bool {
-	for _, group := range groups {
-		// 检查消息是否在该组的pending列表中
-		pending, err := mq.client.XPendingExt(ctx, &redis.XPendingExtArgs{
-			Stream: mq.streamName,
-			Group:  group.Name,
-			Start:  messageID,
-			End:    messageID,
-			Count:  1,
-		}).Result()
-
-		if err != nil {
-			log.Printf("检查pending消息失败 %s: %v", messageID, err)
-			return false
-		}
-
-		// 如果消息在pending列表中，说明未被确认
-		if len(pending) > 0 {
-			return false
+	return func(yield func(string) bool) {
+		for k, ack := range ackIds {
+			if ack {
+				if !yield(k) {
+					return
+				}
+			}
 		}
 	}
+}
 
-	return true
+func (mq *MessageCleaner) Stop() {
+	close(mq.stopChan)
+}
+
+func (mq *MessageCleaner) Wait() {
+	mq.wg.Wait()
+}
+
+func (mq *MessageCleaner) OnStart(ctx context.Context) {
+	if mq.cleanupPolicy.EnableAutoCleanup {
+		mq.wg.Add(1)
+		go mq.autoCleanupMessages(ctx)
+		log.Printf("已启用自动清理，间隔: %v", mq.cleanupPolicy.CleanupInterval)
+	}
 }
 
 // autoCleanupMessages 自动清理已处理的消息
 func (mq *MessageCleaner) autoCleanupMessages(ctx context.Context) {
 	defer mq.wg.Done()
-
-	log.Printf("启动自动清理goroutine，间隔: %v", mq.cleanupPolicy.CleanupInterval)
-
 	ticker := time.NewTicker(mq.cleanupPolicy.CleanupInterval)
 	defer ticker.Stop()
 
